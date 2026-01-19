@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m pip install:*)",
+      "WebFetch(domain:www.fmkorea.com)",
+      "Bash(python:*)",
+      "WebFetch(domain:www.signal.bz)",
+      "WebFetch(domain:zum.com)",
+      "WebFetch(domain:www.nate.com)"
+    ]
+  }
+}
