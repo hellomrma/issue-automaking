@@ -11,7 +11,10 @@
       "WebFetch(domain:www.nate.com)",
       "Bash(.venv\\\\Scripts\\\\python:*)",
       "Bash(timeout /t 3 /nobreak)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd project documentation files\n\n- Update README.md with URL-based generation feature and API details\n- Add CLAUDE.md for Claude Code project context\n- Add .cursorrules for Cursor AI editor\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)"
     ]
   }
 }

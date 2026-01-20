@@ -4,11 +4,13 @@ const EL = {
   trendsContainer: document.getElementById("trendsContainer"),
   keyword: document.getElementById("keyword"),
   sourceUrl: document.getElementById("sourceUrl"),
+  referenceUrl: document.getElementById("referenceUrl"),
+  guide: document.getElementById("guide"),
   modeKeyword: document.getElementById("modeKeyword"),
   modeUrl: document.getElementById("modeUrl"),
   keywordInputSection: document.getElementById("keywordInputSection"),
   urlInputSection: document.getElementById("urlInputSection"),
-  style: document.getElementById("style"),
+  styleRadios: document.querySelectorAll('input[name="style"]'),
   length: document.getElementById("length"),
   useWebSearch: document.getElementById("useWebSearch"),
   useEmoji: document.getElementById("useEmoji"),
@@ -63,7 +65,8 @@ function parseJsonOrFail(text, onHtml) {
 
 function loadStoredApiKey() {
   try {
-    const v = localStorage.getItem(STORAGE_KEY);
+    // sessionStorage 사용 (브라우저 세션 종료 시 자동 삭제)
+    const v = sessionStorage.getItem(STORAGE_KEY);
     if (v && EL.apiKey) EL.apiKey.value = v;
   } catch (_) {}
 }
@@ -71,7 +74,14 @@ function loadStoredApiKey() {
 function saveApiKey() {
   if (!EL.saveKey?.checked) return;
   try {
-    localStorage.setItem(STORAGE_KEY, EL.apiKey?.value || "");
+    // sessionStorage 사용 (localStorage보다 안전)
+    sessionStorage.setItem(STORAGE_KEY, EL.apiKey?.value || "");
+  } catch (_) {}
+}
+
+function clearApiKey() {
+  try {
+    sessionStorage.removeItem(STORAGE_KEY);
   } catch (_) {}
 }
 
@@ -161,12 +171,12 @@ EL.fetchTrends?.addEventListener("click", async () => {
 
     results.forEach((res, i) => {
       if (res.status !== "fulfilled") return;
-      const { name, google, recommend } = res.value;
+      const { name, google } = res.value;
 
-      if (!google.length && !recommend.length) return;
+      if (!google.length) return;
 
       okCount += 1;
-      totalKw += google.length + recommend.length;
+      totalKw += google.length;
 
       // 구글 트렌드 섹션
       if (google.length > 0) {
@@ -177,17 +187,6 @@ EL.fetchTrends?.addEventListener("click", async () => {
         googleBlock.appendChild(googleH4);
         googleBlock.appendChild(createKeywordList(google));
         EL.trendsContainer.appendChild(googleBlock);
-      }
-
-      // 추천 키워드 섹션
-      if (recommend.length > 0) {
-        const recommendBlock = document.createElement("div");
-        recommendBlock.className = "region-trends";
-        const recommendH4 = document.createElement("h4");
-        recommendH4.innerHTML = `<span class="source-badge recommend">추천</span> 인기 주제 (${recommend.length}개)`;
-        recommendBlock.appendChild(recommendH4);
-        recommendBlock.appendChild(createKeywordList(recommend));
-        EL.trendsContainer.appendChild(recommendBlock);
       }
     });
 
@@ -208,9 +207,21 @@ EL.fetchTrends?.addEventListener("click", async () => {
   }
 });
 
+// 선택된 스타일 가져오기
+function getSelectedStyle() {
+  for (const radio of EL.styleRadios) {
+    if (radio.checked) return radio.value;
+  }
+  return "정보성";
+}
+
 // 2. 글 생성 (스트리밍)
 async function generateArticle() {
   let apiEndpoint, body;
+
+  // 공통 옵션
+  const guide = (EL.guide?.value || "").trim();
+  const selectedStyle = getSelectedStyle();
 
   if (currentInputMode === "url") {
     // URL 기반 생성
@@ -226,12 +237,13 @@ async function generateArticle() {
     apiEndpoint = "/api/generate-from-url/stream";
     body = {
       url: url,
-      style: EL.style?.value || "정보성",
+      style: selectedStyle,
       length: EL.length?.value || "medium",
       lang: "ko",
       use_emoji: !!EL.useEmoji?.checked,
       use_web_search: !!EL.useWebSearch?.checked,
     };
+    if (guide) body.guide = guide;
   } else {
     // 키워드 기반 생성
     const kw = (EL.keyword?.value || "").trim();
@@ -239,15 +251,18 @@ async function generateArticle() {
       setStatus(EL.generateStatus, "키워드를 입력하거나 트렌드에서 선택해 주세요.", "error");
       return;
     }
+    const referenceUrl = (EL.referenceUrl?.value || "").trim();
     apiEndpoint = "/api/generate/stream";
     body = {
       keyword: kw,
-      style: EL.style?.value || "정보성",
+      style: selectedStyle,
       length: EL.length?.value || "medium",
       lang: "ko",
       use_emoji: !!EL.useEmoji?.checked,
       use_web_search: !!EL.useWebSearch?.checked,
     };
+    if (guide) body.guide = guide;
+    if (referenceUrl) body.reference_url = referenceUrl;
   }
 
   const key = (EL.apiKey?.value || "").trim();
@@ -334,17 +349,27 @@ EL.copyMd?.addEventListener("click", () => {
   );
 });
 
-EL.downloadMd?.addEventListener("click", () => {
+EL.downloadMd?.addEventListener("click", async () => {
   const text = EL.output?.textContent || "";
   if (!text) return;
   const kw = (EL.keyword?.value || "article").replace(/[^\w\uac00-\ud7a3\s-]/g, "").trim() || "article";
-  const name = `tistory_${kw}_${Date.now().toString(36)}.md`;
-  const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  const filename = `tistory_${kw}_${Date.now().toString(36)}`;
+
+  try {
+    const res = await fetch("/api/save-markdown", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: text, filename }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      alert(`파일이 저장되었습니다: ${data.path}`);
+    } else {
+      alert(`저장 실패: ${data.detail || "알 수 없는 오류"}`);
+    }
+  } catch (e) {
+    alert(`저장 실패: ${e.message}`);
+  }
 });
 
 // 4. 탭 전환 (마크다운 / 미리보기)

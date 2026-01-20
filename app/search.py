@@ -1,6 +1,9 @@
 """키워드에 대한 최신 웹 검색·뉴스 결과 수집 (DuckDuckGo)"""
+import ipaddress
 import logging
 import re
+import socket
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -11,6 +14,146 @@ logger = logging.getLogger("app.search")
 
 # URL 콘텐츠 추출 시 무시할 태그
 _IGNORE_TAGS = {"script", "style", "nav", "footer", "header", "aside", "noscript", "iframe", "form"}
+
+# SSRF 차단 대상 호스트
+_BLOCKED_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+# ---------- 검색 결과 캐싱 ----------
+
+class SearchCache:
+    """웹 검색 결과 캐싱 (메모리 기반)"""
+
+    def __init__(self, ttl_seconds: int = 1800, max_size: int = 100):
+        """
+        Args:
+            ttl_seconds: 캐시 유효 시간 (기본 30분)
+            max_size: 최대 캐시 항목 수 (기본 100개)
+        """
+        self.ttl = ttl_seconds
+        self.max_size = max_size
+        self._cache: dict[str, tuple[str, float]] = {}
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # 5분마다 정리
+
+    def _make_key(self, keyword: str, region: str, timelimit: Optional[str]) -> str:
+        """캐시 키 생성"""
+        return f"{keyword}:{region}:{timelimit or 'none'}"
+
+    def get(self, keyword: str, region: str = "kr-ko", timelimit: Optional[str] = "m") -> Optional[str]:
+        """캐시에서 검색 결과 조회"""
+        self._maybe_cleanup()
+        key = self._make_key(keyword, region, timelimit)
+        if key not in self._cache:
+            return None
+        content, timestamp = self._cache[key]
+        if time.time() - timestamp > self.ttl:
+            del self._cache[key]
+            return None
+        logger.debug(f"검색 캐시 히트: {keyword}")
+        return content
+
+    def set(self, keyword: str, content: str, region: str = "kr-ko", timelimit: Optional[str] = "m"):
+        """검색 결과를 캐시에 저장"""
+        self._maybe_cleanup()
+        # 최대 크기 초과 시 오래된 항목 제거
+        if len(self._cache) >= self.max_size:
+            self._evict_oldest()
+        key = self._make_key(keyword, region, timelimit)
+        self._cache[key] = (content, time.time())
+
+    def _maybe_cleanup(self):
+        """주기적으로 만료된 캐시 정리"""
+        now = time.time()
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        expired_keys = [
+            k for k, (_, ts) in self._cache.items()
+            if now - ts > self.ttl
+        ]
+        for k in expired_keys:
+            del self._cache[k]
+        if expired_keys:
+            logger.debug(f"검색 캐시 정리: {len(expired_keys)}개 만료 항목 삭제")
+
+    def _evict_oldest(self):
+        """가장 오래된 캐시 항목 제거"""
+        if not self._cache:
+            return
+        oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][1])
+        del self._cache[oldest_key]
+
+    def clear(self):
+        """캐시 전체 삭제"""
+        self._cache.clear()
+
+
+# 전역 검색 캐시 인스턴스
+_search_cache = SearchCache()
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    URL이 안전한지 검증합니다 (SSRF 공격 방지).
+    내부 네트워크, localhost, 프라이빗 IP 등을 차단합니다.
+
+    Raises:
+        ValueError: 안전하지 않은 URL인 경우
+    """
+    try:
+        parsed = urlparse(url)
+
+        # 프로토콜 검증
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("HTTP(S) 프로토콜만 지원합니다.")
+
+        hostname = parsed.hostname or ""
+        if not hostname:
+            raise ValueError("호스트명이 없습니다.")
+
+        # localhost 및 차단 호스트 확인
+        hostname_lower = hostname.lower()
+        if hostname_lower in _BLOCKED_HOSTS:
+            raise ValueError("로컬호스트 URL은 허용되지 않습니다.")
+
+        # .local, .internal 등 내부 도메인 차단
+        if hostname_lower.endswith((".local", ".internal", ".localhost", ".localdomain")):
+            raise ValueError("내부 네트워크 도메인은 허용되지 않습니다.")
+
+        # IP 주소인 경우 프라이빗/예약 IP 차단
+        try:
+            # 먼저 호스트명이 IP 주소인지 확인
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private:
+                raise ValueError("프라이빗 IP 주소는 허용되지 않습니다.")
+            if ip.is_reserved:
+                raise ValueError("예약된 IP 주소는 허용되지 않습니다.")
+            if ip.is_loopback:
+                raise ValueError("루프백 IP 주소는 허용되지 않습니다.")
+            if ip.is_link_local:
+                raise ValueError("링크 로컬 IP 주소는 허용되지 않습니다.")
+        except ValueError as e:
+            # IP 주소가 아닌 경우 (도메인)
+            if "허용되지 않습니다" in str(e):
+                raise
+            # 도메인인 경우 DNS 해석하여 IP 확인
+            try:
+                resolved_ips = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                for family, _, _, _, sockaddr in resolved_ips:
+                    ip_str = sockaddr[0]
+                    ip = ipaddress.ip_address(ip_str)
+                    if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                        raise ValueError(f"해당 도메인이 내부 네트워크 IP로 해석됩니다: {ip_str}")
+            except socket.gaierror:
+                # DNS 해석 실패는 요청 시 처리
+                pass
+
+        return True
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"URL 검증 오류: {e}")
 
 
 def fetch_url_content(url: str, timeout: int = 15) -> dict:
@@ -25,7 +168,13 @@ def fetch_url_content(url: str, timeout: int = 15) -> dict:
             "content": str,
             "keywords": list[str]
         }
+
+    Raises:
+        ValueError: URL이 안전하지 않거나 접근 불가한 경우
     """
+    # SSRF 공격 방지: URL 안전성 검증
+    is_safe_url(url)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -192,6 +341,7 @@ def search_web(
     max_news: int = 5,
     region: str = "kr-ko",
     timelimit: Optional[str] = "m",
+    use_cache: bool = True,
 ) -> str:
     """
     키워드로 웹 검색 + 뉴스 검색을 수행하고, 제목·요약·URL을 포맷한 문자열을 반환합니다.
@@ -199,10 +349,18 @@ def search_web(
 
     region: kr-ko(한국), wt-wt(전세계) 등
     timelimit: m(한 달), w(일 주), d(하루), None(제한 없음)
+    use_cache: True면 캐시 사용 (기본값)
     """
     if not (keyword or "").strip():
         return ""
     q = keyword.strip()
+
+    # 캐시 확인
+    if use_cache:
+        cached = _search_cache.get(q, region, timelimit)
+        if cached is not None:
+            return cached
+
     sections: list[str] = []
     text_results: list = []
     news_results: list = []
@@ -247,6 +405,10 @@ def search_web(
             lines.append("\n".join(parts))
         sections.append("--- 뉴스 기사 ---\n" + "\n\n".join(lines))
 
-    if not sections:
-        return ""
-    return "\n\n".join(sections)
+    result = "\n\n".join(sections) if sections else ""
+
+    # 캐시에 저장 (결과가 있는 경우만)
+    if use_cache and result:
+        _search_cache.set(q, result, region, timelimit)
+
+    return result

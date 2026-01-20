@@ -22,6 +22,8 @@ def _build_prompts(
     use_emoji: bool = False,
     web_context: Optional[str] = None,
     length: str = "medium",
+    guide: Optional[str] = None,
+    reference_content: Optional[str] = None,
 ) -> tuple[str, str]:
     """시스템 프롬프트와 사용자 프롬프트를 생성합니다."""
     style_desc = {
@@ -69,6 +71,26 @@ def _build_prompts(
 {web_context}
 ---
 """
+
+    if guide and (guide := guide.strip()):
+        user += f"""
+
+아래는 사용자가 요청한 **글 작성 가이드**입니다. 이 가이드를 최우선으로 반영하여 글을 작성해 주세요:
+
+---
+{guide}
+---
+"""
+
+    if reference_content and (reference_content := reference_content.strip()):
+        user += f"""
+
+아래는 **참고해야 할 URL의 콘텐츠**입니다. 이 내용을 참고하여 글을 작성해 주세요. 원문을 그대로 복사하지 말고 참고만 하세요:
+
+---
+{reference_content[:4000]}
+---
+"""
     return system, user
 
 
@@ -79,6 +101,7 @@ def _build_url_prompts(
     use_emoji: bool = False,
     related_search: str = "",
     length: str = "medium",
+    guide: Optional[str] = None,
 ) -> tuple[str, str]:
     """URL 콘텐츠 기반 블로그 글 생성을 위한 프롬프트를 생성합니다."""
     style_desc = {
@@ -141,6 +164,16 @@ def _build_url_prompts(
 {related_search}
 ---
 """
+
+    if guide and (guide := guide.strip()):
+        user += f"""
+
+아래는 사용자가 요청한 **글 작성 가이드**입니다. 이 가이드를 최우선으로 반영하여 글을 작성해 주세요:
+
+---
+{guide}
+---
+"""
     return system, user
 
 
@@ -161,13 +194,17 @@ def generate_article_md_stream(
     use_emoji: bool = False,
     web_context: Optional[str] = None,
     length: str = "medium",
+    guide: Optional[str] = None,
+    reference_content: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """
     키워드를 바탕으로 티스토리용 마크다운 블로그 글을 스트리밍으로 생성합니다.
     length: short | medium | long
+    guide: 사용자가 원하는 글 작성 방향/톤/포함할 내용
+    reference_content: 참고할 URL의 콘텐츠
     """
     client = Anthropic(api_key=api_key or None)
-    system, user = _build_prompts(keyword, lang, style, use_emoji, web_context, length)
+    system, user = _build_prompts(keyword, lang, style, use_emoji, web_context, length, guide, reference_content)
     model = (os.getenv("CLAUDE_MODEL") or "").strip() or DEFAULT_MODEL
 
     with client.messages.stream(
@@ -190,6 +227,8 @@ def generate_article_md(
     use_emoji: bool = False,
     web_context: Optional[str] = None,
     length: str = "medium",
+    guide: Optional[str] = None,
+    reference_content: Optional[str] = None,
 ) -> str:
     """
     키워드를 바탕으로 티스토리용 마크다운 블로그 글을 생성합니다.
@@ -199,9 +238,11 @@ def generate_article_md(
     use_emoji: True면 제목·소제목·문단에 적절한 이모지 포함
     web_context: 최신 웹 검색 결과 텍스트. 있으면 이를 참고해 최신 정보를 반영
     length: short | medium | long (본문 분량)
+    guide: 사용자가 원하는 글 작성 방향/톤/포함할 내용
+    reference_content: 참고할 URL의 콘텐츠
     """
     client = Anthropic(api_key=api_key or None)
-    system, user = _build_prompts(keyword, lang, style, use_emoji, web_context, length)
+    system, user = _build_prompts(keyword, lang, style, use_emoji, web_context, length, guide, reference_content)
     model = (os.getenv("CLAUDE_MODEL") or "").strip() or DEFAULT_MODEL
 
     resp = client.messages.create(
@@ -225,12 +266,14 @@ def generate_article_from_url_stream(
     use_emoji: bool = False,
     related_search: Optional[str] = None,
     length: str = "medium",
+    guide: Optional[str] = None,
 ) -> Generator[str, None, None]:
     """
     URL 콘텐츠를 기반으로 티스토리용 마크다운 블로그 글을 스트리밍으로 생성합니다.
+    guide: 사용자가 원하는 글 작성 방향/톤/포함할 내용
     """
     client = Anthropic(api_key=api_key or None)
-    system, user = _build_url_prompts(url_content, lang, style, use_emoji, related_search or "", length)
+    system, user = _build_url_prompts(url_content, lang, style, use_emoji, related_search or "", length, guide)
     model = (os.getenv("CLAUDE_MODEL") or "").strip() or DEFAULT_MODEL
 
     with client.messages.stream(
@@ -253,6 +296,7 @@ def generate_article_from_url(
     use_emoji: bool = False,
     related_search: Optional[str] = None,
     length: str = "medium",
+    guide: Optional[str] = None,
 ) -> str:
     """
     URL 콘텐츠를 기반으로 티스토리용 마크다운 블로그 글을 생성합니다.
@@ -264,9 +308,10 @@ def generate_article_from_url(
     use_emoji: True면 제목·소제목·문단에 적절한 이모지 포함
     related_search: 관련 웹 검색 결과 텍스트
     length: short | medium | long (본문 분량)
+    guide: 사용자가 원하는 글 작성 방향/톤/포함할 내용
     """
     client = Anthropic(api_key=api_key or None)
-    system, user = _build_url_prompts(url_content, lang, style, use_emoji, related_search or "", length)
+    system, user = _build_url_prompts(url_content, lang, style, use_emoji, related_search or "", length, guide)
     model = (os.getenv("CLAUDE_MODEL") or "").strip() or DEFAULT_MODEL
 
     resp = client.messages.create(
