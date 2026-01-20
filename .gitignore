@@ -8,3 +8,5 @@ venv/
 .eggs/
 dist/
 build/
+
+nul

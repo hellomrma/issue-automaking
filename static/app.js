@@ -3,6 +3,11 @@ const EL = {
   trendsStatus: document.getElementById("trendsStatus"),
   trendsContainer: document.getElementById("trendsContainer"),
   keyword: document.getElementById("keyword"),
+  sourceUrl: document.getElementById("sourceUrl"),
+  modeKeyword: document.getElementById("modeKeyword"),
+  modeUrl: document.getElementById("modeUrl"),
+  keywordInputSection: document.getElementById("keywordInputSection"),
+  urlInputSection: document.getElementById("urlInputSection"),
   style: document.getElementById("style"),
   length: document.getElementById("length"),
   useWebSearch: document.getElementById("useWebSearch"),
@@ -20,6 +25,9 @@ const EL = {
   copyMd: document.getElementById("copyMd"),
   downloadMd: document.getElementById("downloadMd"),
 };
+
+// 현재 입력 모드 (keyword 또는 url)
+let currentInputMode = "keyword";
 
 // 글자 수 업데이트 함수
 function updateCharCount() {
@@ -66,6 +74,25 @@ function saveApiKey() {
     localStorage.setItem(STORAGE_KEY, EL.apiKey?.value || "");
   } catch (_) {}
 }
+
+// 입력 모드 전환 함수
+function switchInputMode(mode) {
+  currentInputMode = mode;
+  if (mode === "keyword") {
+    EL.modeKeyword?.classList.add("active");
+    EL.modeUrl?.classList.remove("active");
+    EL.keywordInputSection?.classList.remove("hidden");
+    EL.urlInputSection?.classList.add("hidden");
+  } else {
+    EL.modeKeyword?.classList.remove("active");
+    EL.modeUrl?.classList.add("active");
+    EL.keywordInputSection?.classList.add("hidden");
+    EL.urlInputSection?.classList.remove("hidden");
+  }
+}
+
+EL.modeKeyword?.addEventListener("click", () => switchInputMode("keyword"));
+EL.modeUrl?.addEventListener("click", () => switchInputMode("url"));
 
 // 1. 트렌드 키워드 개수
 const TRENDS_LIMIT_KR = 50;
@@ -183,35 +210,62 @@ EL.fetchTrends?.addEventListener("click", async () => {
 
 // 2. 글 생성 (스트리밍)
 async function generateArticle() {
-  const kw = (EL.keyword?.value || "").trim();
-  if (!kw) {
-    setStatus(EL.generateStatus, "키워드를 입력하거나 트렌드에서 선택해 주세요.", "error");
-    return;
+  let apiEndpoint, body;
+
+  if (currentInputMode === "url") {
+    // URL 기반 생성
+    const url = (EL.sourceUrl?.value || "").trim();
+    if (!url) {
+      setStatus(EL.generateStatus, "분석할 URL을 입력해 주세요.", "error");
+      return;
+    }
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      setStatus(EL.generateStatus, "올바른 URL 형식이 아닙니다. (http:// 또는 https://로 시작해야 합니다)", "error");
+      return;
+    }
+    apiEndpoint = "/api/generate-from-url/stream";
+    body = {
+      url: url,
+      style: EL.style?.value || "정보성",
+      length: EL.length?.value || "medium",
+      lang: "ko",
+      use_emoji: !!EL.useEmoji?.checked,
+      use_web_search: !!EL.useWebSearch?.checked,
+    };
+  } else {
+    // 키워드 기반 생성
+    const kw = (EL.keyword?.value || "").trim();
+    if (!kw) {
+      setStatus(EL.generateStatus, "키워드를 입력하거나 트렌드에서 선택해 주세요.", "error");
+      return;
+    }
+    apiEndpoint = "/api/generate/stream";
+    body = {
+      keyword: kw,
+      style: EL.style?.value || "정보성",
+      length: EL.length?.value || "medium",
+      lang: "ko",
+      use_emoji: !!EL.useEmoji?.checked,
+      use_web_search: !!EL.useWebSearch?.checked,
+    };
   }
+
+  const key = (EL.apiKey?.value || "").trim();
+  if (key) body.anthropic_api_key = key;
 
   // AbortController 생성
   currentAbortController = new AbortController();
 
-  setStatus(EL.generateStatus, "글을 생성하고 있습니다…", "loading");
+  const loadingMsg = currentInputMode === "url" ? "URL을 분석하고 글을 생성하고 있습니다…" : "글을 생성하고 있습니다…";
+  setStatus(EL.generateStatus, loadingMsg, "loading");
   EL.generate.disabled = true;
   EL.cancelGenerate?.classList.remove("hidden");
   EL.output.textContent = "";
   updateCharCount();
   saveApiKey();
 
-  const body = {
-    keyword: kw,
-    style: EL.style?.value || "정보성",
-    length: EL.length?.value || "medium",
-    lang: "ko",
-    use_emoji: !!EL.useEmoji?.checked,
-    use_web_search: !!EL.useWebSearch?.checked,
-  };
-  const key = (EL.apiKey?.value || "").trim();
-  if (key) body.anthropic_api_key = key;
-
   try {
-    const res = await fetch("/api/generate/stream", {
+    const res = await fetch(apiEndpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

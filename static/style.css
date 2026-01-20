@@ -76,6 +76,37 @@ body {
 }
 .trend-sub:first-of-type { margin-top: 0; }
 
+/* Input mode tabs (키워드/URL) */
+.input-mode-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.mode-tab {
+  padding: 0.5rem 1rem;
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mode-tab:hover {
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.mode-tab.active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
 .row {
   display: flex;
   flex-wrap: wrap;
@@ -100,6 +131,7 @@ label {
 }
 
 input[type="text"],
+input[type="url"],
 input[type="password"],
 select {
   padding: 0.55rem 0.75rem;
@@ -113,6 +145,7 @@ select {
 }
 
 input[type="text"]:focus,
+input[type="url"]:focus,
 input[type="password"]:focus,
 select:focus {
   outline: none;

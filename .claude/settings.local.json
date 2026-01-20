@@ -8,7 +8,10 @@
       "Bash(python:*)",
       "WebFetch(domain:www.signal.bz)",
       "WebFetch(domain:zum.com)",
-      "WebFetch(domain:www.nate.com)"
+      "WebFetch(domain:www.nate.com)",
+      "Bash(.venv\\\\Scripts\\\\python:*)",
+      "Bash(timeout /t 3 /nobreak)",
+      "Bash(curl:*)"
     ]
   }
 }

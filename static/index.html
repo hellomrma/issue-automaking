@@ -31,10 +31,20 @@
 
       <section class="card generate-card">
         <h2>2. 글 생성</h2>
-        <div class="row">
+        <div class="input-mode-tabs">
+          <button type="button" id="modeKeyword" class="mode-tab active">키워드로 생성</button>
+          <button type="button" id="modeUrl" class="mode-tab">URL 분석으로 생성</button>
+        </div>
+        <div id="keywordInputSection" class="row">
           <label class="flex1">
             키워드 (트렌드에서 선택하거나 직접 입력)
             <input type="text" id="keyword" placeholder="예: ChatGPT 활용법" autocomplete="off" />
+          </label>
+        </div>
+        <div id="urlInputSection" class="row hidden">
+          <label class="flex1">
+            분석할 URL (해당 페이지의 내용을 바탕으로 글 생성)
+            <input type="url" id="sourceUrl" placeholder="https://example.com/article" autocomplete="off" />
           </label>
         </div>
         <div class="row">
