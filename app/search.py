@@ -9,6 +9,9 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 logger = logging.getLogger("app.search")
 
@@ -97,6 +100,71 @@ class SearchCache:
 _search_cache = SearchCache()
 
 
+class BlockedAddressError(ValueError):
+    """내부 네트워크 주소로의 접속 시도 (SSRF)"""
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """내부·예약 대역 IP 여부 (IPv4-mapped IPv6 포함)"""
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_private or ip.is_reserved or ip.is_loopback
+        or ip.is_link_local or ip.is_multicast or ip.is_unspecified
+    )
+
+
+# ---------- 실제 접속 IP 검증 (DNS 리바인딩 방지) ----------
+# is_safe_url()의 DNS 조회와 실제 접속 사이에 DNS 응답이 바뀌어도,
+# 소켓이 연결된 상대 IP를 다시 확인해 내부 주소면 끊습니다.
+
+class _PeerCheckMixin:
+    def _new_conn(self):
+        sock = super()._new_conn()
+        peer = ipaddress.ip_address(sock.getpeername()[0].split("%")[0])
+        if _is_blocked_ip(peer):
+            sock.close()
+            raise BlockedAddressError(f"내부 네트워크 주소로는 접속할 수 없습니다: {peer}")
+        return sock
+
+
+class _SafeHTTPConnection(_PeerCheckMixin, HTTPConnection):
+    pass
+
+
+class _SafeHTTPSConnection(_PeerCheckMixin, HTTPSConnection):
+    pass
+
+
+class _SafeHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _SafeHTTPConnection
+
+
+class _SafeHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _SafeHTTPSConnection
+
+
+class _SafeAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _SafeHTTPConnectionPool,
+            "https": _SafeHTTPSConnectionPool,
+        }
+
+
+def _make_safe_session() -> requests.Session:
+    session = requests.Session()
+    # 프록시를 거치면 실제 접속 IP를 검증할 수 없으므로 환경변수 프록시는 쓰지 않음
+    session.trust_env = False
+    session.mount("http://", _SafeAdapter())
+    session.mount("https://", _SafeAdapter())
+    return session
+
+
+_session = _make_safe_session()
+
+
 def is_safe_url(url: str) -> bool:
     """
     URL이 안전한지 검증합니다 (SSRF 공격 방지).
@@ -146,8 +214,8 @@ def is_safe_url(url: str) -> bool:
                 resolved_ips = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
                 for family, _, _, _, sockaddr in resolved_ips:
                     ip_str = sockaddr[0]
-                    ip = ipaddress.ip_address(ip_str)
-                    if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                    ip = ipaddress.ip_address(ip_str.split("%")[0])
+                    if _is_blocked_ip(ip):
                         raise ValueError(f"해당 도메인이 내부 네트워크 IP로 해석됩니다: {ip_str}")
             except socket.gaierror:
                 # DNS 해석 실패는 요청 시 처리
@@ -173,7 +241,9 @@ def _download_html(url: str, headers: dict, timeout: int) -> tuple[bytes, Option
         # SSRF 공격 방지: 리다이렉트 대상까지 매번 검증
         is_safe_url(current)
         try:
-            resp = requests.get(current, headers=headers, timeout=timeout, allow_redirects=False, stream=True)
+            resp = _session.get(current, headers=headers, timeout=timeout, allow_redirects=False, stream=True)
+        except BlockedAddressError:
+            raise
         except Exception as e:
             logger.warning("fetch_url_content request failed: %s", e)
             raise ValueError(f"URL을 가져올 수 없습니다: {e}")

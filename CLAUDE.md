@@ -83,6 +83,7 @@ python -m pip install -r requirements.txt
 | `ANTHROPIC_API_KEY` | O (또는 웹에서 입력) | Claude API 키 |
 | `CLAUDE_MODEL` | X | 사용할 Claude 모델 (기본: claude-sonnet-5-5) |
 | `USE_CSV_TRENDS` | X | CSV 트렌드 수집 활성화 (기본: false) |
+| `TRUST_PROXY` | X | 리버스 프록시 뒤에서 X-Forwarded-For로 클라이언트 식별 (기본: false) |
 
 ## API 엔드포인트
 

@@ -10,3 +10,6 @@ dist/
 build/
 
 nul
+
+# 생성된 글 (로컬 보관용)
+downloads/*.md

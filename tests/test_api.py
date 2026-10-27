@@ -224,3 +224,40 @@ class TestGenerateEndpoints:
     def test_meta_empty_markdown(self):
         res = client.post("/api/meta", json={"markdown": "  "})
         assert res.status_code == 422
+
+
+class TestSaveMarkdown:
+    """POST /api/save-markdown 제한"""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, tmp_path):
+        from app.rate_limit import save_limiter
+
+        save_limiter.requests.clear()
+        monkeypatch.setattr("app.main._DOWNLOADS_DIR", str(tmp_path))
+        self.dir = tmp_path
+
+    def test_saves_file(self):
+        res = client.post("/api/save-markdown", json={"content": "# 글", "filename": "테스트 글"})
+        assert res.status_code == 200
+        assert (self.dir / res.json()["filename"]).read_text(encoding="utf-8") == "# 글"
+
+    def test_too_long_rejected(self):
+        from app.main import _MAX_SAVE_CHARS
+
+        res = client.post("/api/save-markdown", json={"content": "가" * (_MAX_SAVE_CHARS + 1)})
+        assert res.status_code == 422
+
+    def test_file_count_cap(self, monkeypatch):
+        monkeypatch.setattr("app.main._MAX_SAVED_FILES", 2)
+        for i in range(2):
+            (self.dir / f"a{i}.md").write_text("x", encoding="utf-8")
+        res = client.post("/api/save-markdown", json={"content": "# 글"})
+        assert res.status_code == 507
+
+    def test_rate_limited(self):
+        from app.rate_limit import save_limiter
+
+        for _ in range(save_limiter.requests_per_minute):
+            assert client.post("/api/save-markdown", json={"content": "# 글"}).status_code == 200
+        assert client.post("/api/save-markdown", json={"content": "# 글"}).status_code == 429

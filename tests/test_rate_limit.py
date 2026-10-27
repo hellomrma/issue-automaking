@@ -66,8 +66,8 @@ class TestRateLimiter:
         assert limiter.get_remaining(request) == 2
 
     def test_forwarded_for_header(self):
-        """X-Forwarded-For 헤더 지원"""
-        limiter = RateLimiter(requests_per_minute=2)
+        """trust_proxy=True면 X-Forwarded-For 첫 IP로 식별"""
+        limiter = RateLimiter(requests_per_minute=2, trust_proxy=True)
         request = MagicMock()
         request.headers.get.return_value = "10.0.0.1, 10.0.0.2"
 
@@ -75,6 +75,29 @@ class TestRateLimiter:
         limiter.record_request(request)
 
         assert limiter.is_allowed(request) is False
+        assert "10.0.0.1" in limiter.requests
+
+    def test_forwarded_for_ignored_by_default(self):
+        """프록시를 신뢰하지 않으면 X-Forwarded-For 위조로 제한을 우회할 수 없음"""
+        limiter = RateLimiter(requests_per_minute=2, trust_proxy=False)
+        for spoofed in ("1.1.1.1", "2.2.2.2", "3.3.3.3"):
+            request = self._make_request("5.5.5.5")
+            request.headers.get.return_value = spoofed
+            if spoofed == "3.3.3.3":
+                assert limiter.is_allowed(request) is False
+            else:
+                limiter.record_request(request)
+
+    def test_expired_clients_are_removed(self):
+        """1분 지난 기록은 정리되어 키가 남지 않음"""
+        limiter = RateLimiter(requests_per_minute=5)
+        limiter.requests["9.9.9.9"].append(time.time() - 120)
+        limiter._last_sweep = 0
+
+        limiter.record_request(self._make_request("8.8.8.8"))
+
+        assert "9.9.9.9" not in limiter.requests
+        assert "8.8.8.8" in limiter.requests
 
     def test_reset_time(self):
         """리셋 시간 확인"""

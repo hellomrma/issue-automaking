@@ -30,10 +30,53 @@ def fake_get(monkeypatch):
             calls.append((url, kwargs))
             return queue.pop(0)
 
-        monkeypatch.setattr(search.requests, "get", _get)
+        monkeypatch.setattr(search._session, "get", _get)
         return calls
 
     return install
+
+
+@pytest.fixture
+def local_server():
+    """127.0.0.1 에서 응답하는 HTTP 서버 (DNS 리바인딩 대상 역할)"""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<title>internal</title>")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server.server_address[1]
+    server.shutdown()
+
+
+class TestPeerCheck:
+    def test_blocks_connection_to_internal_ip(self, local_server):
+        """실제 접속한 상대가 내부 IP면 차단"""
+        with pytest.raises(search.BlockedAddressError):
+            search._session.get(f"http://127.0.0.1:{local_server}/", timeout=5)
+
+    def test_dns_rebinding_blocked(self, local_server, monkeypatch):
+        """사전 검사(DNS)를 통과해도 접속 시점에 내부 IP면 차단"""
+        monkeypatch.setattr(search, "is_safe_url", lambda url: True)  # 검사 시점엔 공개 IP였다고 가정
+        with pytest.raises(search.BlockedAddressError, match="내부 네트워크"):
+            search.fetch_url_content(f"http://127.0.0.1:{local_server}/")
+
+    def test_blocked_ip_ranges(self):
+        import ipaddress
+
+        for ip in ("10.0.0.1", "169.254.169.254", "::1", "::ffff:127.0.0.1", "0.0.0.0", "224.0.0.1"):
+            assert search._is_blocked_ip(ipaddress.ip_address(ip)), ip
+        assert not search._is_blocked_ip(ipaddress.ip_address("8.8.8.8"))
 
 
 class TestFetchUrlContent:

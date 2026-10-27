@@ -499,8 +499,11 @@ EL.genMeta?.addEventListener("click", async () => {
 EL.downloadMd?.addEventListener("click", async () => {
   const text = EL.output?.textContent || "";
   if (!text) return;
-  const kw = (EL.keyword?.value || "article").replace(/[^\w\uac00-\ud7a3\s-]/g, "").trim() || "article";
-  const filename = `tistory_${kw}_${Date.now().toString(36)}`;
+  // \ud30c\uc77c\uba85: \uae00 \uc81c\ubaa9(\uccab # \uc904) \u2192 \ud0a4\uc6cc\ub4dc \ubaa8\ub4dc\uba74 \ud0a4\uc6cc\ub4dc \u2192 article
+  const heading = text.match(/^#\s+(.+)$/m)?.[1] || "";
+  const keyword = currentInputMode === "keyword" ? (EL.keyword?.value || "") : "";
+  const base = (heading || keyword).replace(/[^\w\uac00-\ud7a3\s-]/g, "").trim().slice(0, 40) || "article";
+  const filename = `tistory_${base}_${Date.now().toString(36)}`;
 
   try {
     const res = await fetch("/api/save-markdown", {
@@ -512,7 +515,8 @@ EL.downloadMd?.addEventListener("click", async () => {
     if (data.success) {
       notify(`${data.path}에 저장했습니다.`);
     } else {
-      notify(`저장하지 못했습니다: ${data.detail || "서버 응답을 확인해 주세요."}`, "error");
+      const detail = Array.isArray(data.detail) ? data.detail[0]?.msg : data.detail;
+      notify(`저장하지 못했습니다: ${detail || "서버 응답을 확인해 주세요."}`, "error");
     }
   } catch (e) {
     notify(`저장하지 못했습니다: ${e.message}`, "error");

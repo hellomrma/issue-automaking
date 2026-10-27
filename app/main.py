@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
-from app.rate_limit import generate_limiter, rate_limit, trends_limiter
+from app.rate_limit import generate_limiter, rate_limit, save_limiter, trends_limiter
 from app.search import fetch_url_content, search_related_to_url, search_web
 from app.trends import REGIONS, get_trending_keywords
 from app.writer import (
@@ -393,6 +393,11 @@ def api_meta(
     return {"titles": meta.titles, "meta_description": meta.meta_description}
 
 
+# 저장 제한 (디스크 가득 채우기 방지)
+_MAX_SAVE_CHARS = 200_000
+_MAX_SAVED_FILES = 1000
+
+
 class SaveMarkdownRequest(BaseModel):
     content: str
     filename: Optional[str] = None
@@ -402,6 +407,8 @@ class SaveMarkdownRequest(BaseModel):
     def validate_content(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("저장할 내용이 없습니다.")
+        if len(v) > _MAX_SAVE_CHARS:
+            raise ValueError(f"글이 너무 깁니다. ({_MAX_SAVE_CHARS:,}자 이하만 저장할 수 있습니다)")
         return v
 
     @field_validator("filename")
@@ -448,13 +455,26 @@ def _get_safe_filepath(downloads_dir: "Path", filename: str) -> "Path":
     return filepath
 
 
+_DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads")
+
+
 @app.post("/api/save-markdown")
-def api_save_markdown(body: SaveMarkdownRequest):
+def api_save_markdown(
+    request: Request,
+    body: SaveMarkdownRequest,
+    _: None = Depends(rate_limit(save_limiter)),
+):
     """마크다운 파일을 downloads 폴더에 저장"""
     from pathlib import Path
 
-    downloads_dir = Path(__file__).parent.parent / "downloads"
+    downloads_dir = Path(_DOWNLOADS_DIR)
     downloads_dir.mkdir(exist_ok=True)
+
+    if sum(1 for _ in downloads_dir.glob("*.md")) >= _MAX_SAVED_FILES:
+        raise HTTPException(
+            status_code=507,
+            detail=f"저장된 글이 {_MAX_SAVED_FILES}개를 넘었습니다. downloads 폴더를 정리한 뒤 다시 저장해 주세요.",
+        )
 
     # 파일명 생성
     if body.filename:
