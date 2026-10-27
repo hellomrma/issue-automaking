@@ -109,6 +109,30 @@ FALLBACK_KEYWORDS = [
 ]
 
 
+# RSS 키워드별 관련 뉴스 (키워드 -> [{headline, url, source}]). 마지막 RSS 수집 결과 기준
+_trend_news: dict[str, list[dict]] = {}
+
+
+def _parse_news(articles: list) -> list[dict]:
+    """RSS 뉴스 항목에서 제목·URL·언론사만 추출 (최대 3개, http(s) 링크만)"""
+    news = []
+    for a in articles:
+        if not isinstance(a, dict):
+            continue
+        headline = (a.get("headline") or a.get("title") or "").strip()
+        url = (a.get("url") or "").strip()
+        if headline and url.startswith(("http://", "https://")):
+            news.append({"headline": headline, "url": url, "source": (a.get("source") or "").strip()})
+        if len(news) >= 3:
+            break
+    return news
+
+
+def get_trend_news(keywords: list[str]) -> dict[str, list[dict]]:
+    """키워드별 관련 뉴스 (RSS에 뉴스가 있던 키워드만)"""
+    return {k: _trend_news[k] for k in keywords if _trend_news.get(k)}
+
+
 def _parse_csv_keywords(path: str, limit: int) -> list[str]:
     """CSV(JSON) 내보내기 파일에서 'Trends' 컬럼만 추출. 최대 limit개."""
     keywords: list[str] = []
@@ -193,10 +217,14 @@ def get_trending_keywords(
         for x in (data or []):
             if isinstance(x, dict):
                 k = x.get("trend") or x.get("title")
+                articles = x.get("news_articles") or []
             else:
                 k = getattr(x, "trend", None) or getattr(x, "title", None)
+                articles = getattr(x, "news_articles", None) or []
             if k and str(k).strip():
-                rss_keywords.append(str(k).strip())
+                k = str(k).strip()
+                rss_keywords.append(k)
+                _trend_news[k] = _parse_news(articles)
     except Exception as e:
         logger.warning("RSS 트렌드 수집 실패 (region=%s): %s", region, e)
 

@@ -92,3 +92,58 @@ class TestPrompts:
     def test_url_prompt_includes_content(self):
         _, user = writer._build_url_prompts({"url": "https://a.com", "title": "T", "content": "원문"}, guide="톤")
         assert "원문" in user and "새로운 관점" in user and "톤" in user
+
+
+class TestSourcesAndSearch:
+    def test_sources_only_with_context(self):
+        _, without = writer._build_prompts("키워드")
+        _, with_ctx = writer._build_prompts("키워드", web_context="검색결과")
+        assert "참고한 자료" not in without
+        assert "참고한 자료" in with_ctx
+
+    def test_sources_can_be_disabled(self):
+        _, user = writer._build_prompts("키워드", web_context="검색결과", include_sources=False)
+        assert "참고한 자료" not in user
+
+    def test_url_prompt_always_has_sources(self):
+        _, user = writer._build_url_prompts({"url": "https://a.com", "content": "원문"})
+        assert "참고한 자료" in user
+
+    def test_claude_search_adds_tool(self, fake_claude):
+        calls = fake_claude(["x"])
+        list(writer.generate_article_md_stream("키워드", claude_search=True))
+        assert calls[0]["tools"][0]["type"] == "web_search_20260209"
+        assert "web_search 도구" in calls[0]["messages"][0]["content"]
+
+    def test_pause_turn_resumes(self, monkeypatch):
+        """pause_turn이면 이전 응답을 assistant로 붙여 이어서 요청"""
+        calls = []
+        results = [("앞부분", "pause_turn"), ("뒷부분", "end_turn")]
+
+        def _stream(**kwargs):
+            calls.append(kwargs)
+            text, stop = results[len(calls) - 1]
+            s = _FakeStream([text], stop)
+            s.get_final_message = lambda: SimpleNamespace(stop_reason=stop, content=[{"type": "text", "text": text}])
+            return s
+
+        client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(stream=_stream)))
+        monkeypatch.setattr(writer, "Anthropic", lambda api_key=None: client)
+
+        text = "".join(writer.generate_article_md_stream("키워드", claude_search=True))
+        assert text == "앞부분뒷부분"
+        assert calls[1]["messages"][1]["role"] == "assistant"
+
+
+class TestRevise:
+    def test_section_prompt(self, fake_claude):
+        calls = fake_claude(["## 새 섹션"])
+        out = "".join(writer.revise_article_stream("# 글\n## 섹션\n내용", "더 짧게", section="## 섹션\n내용"))
+        assert out == "## 새 섹션"
+        prompt = calls[0]["messages"][0]["content"]
+        assert "[고칠 부분]" in prompt and "더 짧게" in prompt
+
+    def test_whole_prompt(self, fake_claude):
+        calls = fake_claude(["# 글"])
+        list(writer.revise_article_stream("# 글", "톤을 밝게"))
+        assert "[고칠 부분]" not in calls[0]["messages"][0]["content"]

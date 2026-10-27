@@ -23,10 +23,20 @@
         <div class="block">
           <div class="block-head">
             <h2>오늘의 검색어</h2>
-            <button type="button" id="fetchTrends" class="btn btn-quiet">불러오기</button>
+            <div class="block-actions">
+              <button type="button" id="multiPick" class="btn btn-quiet hidden" aria-pressed="false">여러 개 고르기</button>
+              <button type="button" id="fetchTrends" class="btn btn-quiet">불러오기</button>
+            </div>
           </div>
           <div id="trendsStatus" class="status" aria-live="polite"></div>
           <div id="trendsContainer" class="trends"></div>
+          <div id="trendNews" class="trend-news hidden" aria-live="polite"></div>
+          <div id="batchBar" class="batch-bar hidden">
+            <span id="batchCount">0개 고름</span>
+            <button type="button" id="batchStart" class="btn btn-primary" disabled>연달아 생성</button>
+            <button type="button" id="batchStop" class="btn btn-quiet hidden">멈추기</button>
+          </div>
+          <ol id="batchList" class="batch-list hidden" aria-live="polite"></ol>
         </div>
 
         <div class="block">
@@ -41,6 +51,7 @@
               <span class="field-label">키워드</span>
               <input type="text" id="keyword" placeholder="검색어를 고르거나 직접 입력하세요" autocomplete="off" />
             </label>
+            <div id="dupNotice" class="dup-notice hidden" aria-live="polite"></div>
             <label class="field">
               <span class="field-label">참고할 글 <span class="optional">선택</span></span>
               <input type="url" id="referenceUrl" placeholder="https://" autocomplete="off" />
@@ -97,6 +108,8 @@
             <summary>세부 설정</summary>
             <div class="checks">
               <label><input type="checkbox" id="useWebSearch" checked /> 최신 뉴스·검색 결과 반영</label>
+              <label class="check-sub"><input type="checkbox" id="useClaudeSearch" /> Claude가 직접 웹 검색 <span class="optional">더 정확하지만 검색 1,000회당 약 $10 추가</span></label>
+              <label><input type="checkbox" id="includeSources" checked /> 글 끝에 참고한 자료 링크 넣기</label>
               <label><input type="checkbox" id="useEmoji" checked /> 이모지 넣기</label>
             </div>
             <label class="field">
@@ -113,6 +126,12 @@
           <kbd class="shortcut">Ctrl + Enter</kbd>
         </div>
         <div id="generateStatus" class="status" aria-live="polite"></div>
+
+        <details class="block history" open>
+          <summary><h2>지난 글</h2> <span id="historyCount" class="history-count"></span></summary>
+          <input type="search" id="historySearch" placeholder="제목이나 키워드로 찾기" aria-label="지난 글 검색" />
+          <ul id="historyList" class="history-list"></ul>
+        </details>
       </section>
 
       <section class="manuscript" aria-label="결과">
@@ -135,6 +154,21 @@
           <button type="button" id="genMeta" class="btn btn-quiet">제목·설명 추천</button>
           <button type="button" id="downloadMd" class="btn btn-quiet">서버에 저장</button>
           <span id="actionStatus" class="status inline" aria-live="polite"></span>
+        </div>
+
+        <div id="reviseBar" class="revise-bar hidden">
+          <div class="revise-row">
+            <select id="reviseTarget" aria-label="고칠 범위"></select>
+            <input type="text" id="reviseInstruction" placeholder="어떻게 고칠까요? 예: 더 짧고 쉽게" aria-label="고칠 내용" maxlength="500" />
+            <button type="button" id="revise" class="btn btn-ink">다듬기</button>
+          </div>
+          <div class="revise-presets">
+            <button type="button" class="chip" data-revise-preset="더 짧고 간결하게 줄여 주세요">더 짧게</button>
+            <button type="button" class="chip" data-revise-preset="초보자도 이해하기 쉬운 말로 풀어 주세요">더 쉽게</button>
+            <button type="button" class="chip" data-revise-preset="구체적인 예시나 사례를 하나 더 넣어 주세요">예시 추가</button>
+            <button type="button" class="chip" data-revise-preset="말투를 더 친근하고 가볍게 바꿔 주세요">더 친근하게</button>
+          </div>
+          <div id="reviseStatus" class="status" aria-live="polite"></div>
         </div>
 
         <div id="metaStatus" class="status" aria-live="polite"></div>

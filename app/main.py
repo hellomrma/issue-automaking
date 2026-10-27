@@ -15,13 +15,16 @@ from pydantic import BaseModel, field_validator
 
 from app.rate_limit import generate_limiter, rate_limit, save_limiter, trends_limiter
 from app.search import fetch_url_content, search_related_to_url, search_web
-from app.trends import REGIONS, get_trending_keywords
+from app import history
+from app.trends import REGIONS, get_trend_news, get_trending_keywords
 from app.writer import (
+    TRUNCATED_NOTICE,
     generate_article_from_url,
     generate_article_from_url_stream,
     generate_article_md,
     generate_article_md_stream,
     generate_article_meta,
+    revise_article_stream,
 )
 
 load_dotenv()
@@ -53,6 +56,7 @@ def api_trends(
             "source": source,
             "google": google_keywords,
             "recommend": recommend_keywords,
+            "news": get_trend_news(google_keywords),
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -135,6 +139,8 @@ class BaseGenerateRequest(BaseModel):
     length: str = "medium"
     use_emoji: bool = False
     use_web_search: bool = True
+    use_claude_search: bool = False  # True면 DuckDuckGo 대신 Claude 웹 검색 도구 사용
+    include_sources: bool = True
     guide: Optional[str] = None
 
     @field_validator("anthropic_api_key")
@@ -232,8 +238,9 @@ def _keyword_generate_kwargs(body: GenerateRequest) -> dict:
     """키워드 기반 글 생성 함수에 넘길 인자 (웹 검색·참고 URL 포함)"""
     api_key = _resolve_api_key(body)
     keyword = body.keyword.strip()
+    claude_search = body.use_web_search and body.use_claude_search
     web_context = ""
-    if body.use_web_search:
+    if body.use_web_search and not claude_search:
         try:
             web_context = search_web(keyword, max_results=5, region=_search_region(body.lang), timelimit="m")
         except Exception as e:
@@ -249,14 +256,17 @@ def _keyword_generate_kwargs(body: GenerateRequest) -> dict:
         "length": body.length,
         "guide": body.guide,
         "reference_content": _fetch_reference_content(body.reference_url) if body.reference_url else None,
+        "include_sources": body.include_sources,
+        "claude_search": claude_search,
     }
 
 
 def _url_generate_kwargs(body: GenerateFromUrlRequest) -> dict:
     """URL 기반 글 생성 함수에 넘길 인자 (URL 분석·관련 검색 포함)"""
     api_key = _resolve_api_key(body)
+    claude_search = body.use_web_search and body.use_claude_search
     try:
-        if body.use_web_search:
+        if body.use_web_search and not claude_search:
             url_content, related_search = search_related_to_url(
                 body.url, max_results=5, max_news=5, region=_search_region(body.lang), timelimit="m"
             )
@@ -277,6 +287,8 @@ def _url_generate_kwargs(body: GenerateFromUrlRequest) -> dict:
         "related_search": related_search,
         "length": body.length,
         "guide": body.guide,
+        "include_sources": body.include_sources,
+        "claude_search": claude_search,
     }
 
 
@@ -302,16 +314,56 @@ def _run_generate(func: Callable, kwargs: dict):
         raise HTTPException(status_code=502, detail=_error_detail(e))
 
 
-def _stream_response(func: Callable[..., Iterator[str]], kwargs: dict) -> StreamingResponse:
-    """생성 스트림을 응답으로 감싸고, 도중 오류는 [ERROR] 줄로 전달"""
+def _history_meta(body: BaseGenerateRequest) -> dict:
+    """이력에 남길 요청 정보"""
+    if isinstance(body, GenerateFromUrlRequest):
+        meta = {"mode": "url", "source_url": body.url}
+    else:
+        meta = {"mode": "keyword", "keyword": body.keyword.strip()}
+    return {**meta, "style": body.style, "length": body.length}
+
+
+def _save_history(meta: dict, markdown: str) -> Optional[int]:
+    """이력 저장. 저장에 실패해도 글 생성은 계속되도록 None 반환"""
+    try:
+        return history.create(**meta, markdown=markdown)
+    except Exception:
+        logger.exception("history save failed")
+        return None
+
+
+def _stream_response(
+    func: Callable[..., Iterator[str]], kwargs: dict, history_meta: Optional[dict] = None
+) -> StreamingResponse:
+    """
+    생성 스트림을 응답으로 감싸고, 도중 오류는 [ERROR] 줄로 전달.
+    history_meta가 있으면 이력에 기록하고 X-History-Id 헤더로 id를 알려 줍니다.
+    (중간에 멈춰도 그때까지 쓴 글을 저장)
+    """
+    history_id = _save_history(history_meta, "") if history_meta else None
+
     def generate():
+        parts: list[str] = []
         try:
-            yield from func(**kwargs)
+            for chunk in func(**kwargs):
+                parts.append(chunk)
+                yield chunk
         except Exception as e:
             logger.exception("%s failed", func.__name__)
             yield f"\n\n[ERROR] {_error_detail(e)}"
+        finally:
+            if history_id is not None:
+                text = "".join(parts).replace(TRUNCATED_NOTICE, "").strip()
+                try:
+                    if text:
+                        history.update_markdown(history_id, text)
+                    else:
+                        history.delete(history_id)
+                except Exception:
+                    logger.exception("history update failed")
 
-    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
+    headers = {"X-History-Id": str(history_id)} if history_id is not None else None
+    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8", headers=headers)
 
 
 @app.post("/api/generate")
@@ -322,7 +374,7 @@ def api_generate(
 ):
     """키워드로 블로그 글(마크다운) 생성"""
     md = _run_generate(generate_article_md, _keyword_generate_kwargs(body))
-    return {"markdown": md, "keyword": body.keyword}
+    return {"markdown": md, "keyword": body.keyword, "history_id": _save_history(_history_meta(body), md)}
 
 
 @app.post("/api/generate/stream")
@@ -332,7 +384,7 @@ def api_generate_stream(
     _: None = Depends(rate_limit(generate_limiter)),
 ):
     """키워드로 블로그 글(마크다운) 스트리밍 생성"""
-    return _stream_response(generate_article_md_stream, _keyword_generate_kwargs(body))
+    return _stream_response(generate_article_md_stream, _keyword_generate_kwargs(body), _history_meta(body))
 
 
 @app.post("/api/generate-from-url")
@@ -350,6 +402,7 @@ def api_generate_from_url(
         "url": body.url,
         "analyzed_title": url_content.get("title", ""),
         "keywords": url_content.get("keywords", []),
+        "history_id": _save_history(_history_meta(body), md),
     }
 
 
@@ -360,7 +413,111 @@ def api_generate_from_url_stream(
     _: None = Depends(rate_limit(generate_limiter)),
 ):
     """URL 콘텐츠를 분석하여 블로그 글(마크다운) 스트리밍 생성"""
-    return _stream_response(generate_article_from_url_stream, _url_generate_kwargs(body))
+    return _stream_response(generate_article_from_url_stream, _url_generate_kwargs(body), _history_meta(body))
+
+
+# ---------- 글 다듬기 ----------
+
+class ReviseRequest(BaseModel):
+    """글 다듬기 요청. section이 있으면 그 부분만 고칩니다."""
+    markdown: str
+    instruction: str
+    section: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+
+    @field_validator("markdown")
+    @classmethod
+    def validate_markdown(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("다듬을 글이 없습니다.")
+        if len(v) > 50_000:
+            raise ValueError("글이 너무 깁니다.")
+        return v
+
+    @field_validator("instruction")
+    @classmethod
+    def validate_instruction(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("어떻게 고칠지 적어 주세요.")
+        if len(v) > 500:
+            raise ValueError("요청은 500자 이하여야 합니다.")
+        return v
+
+    @field_validator("section")
+    @classmethod
+    def validate_section(cls, v: Optional[str]) -> Optional[str]:
+        return v if v and v.strip() else None
+
+    @field_validator("anthropic_api_key")
+    @classmethod
+    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_api_key(v)
+
+
+@app.post("/api/revise/stream")
+def api_revise_stream(
+    request: Request,
+    body: ReviseRequest,
+    _: None = Depends(rate_limit(generate_limiter)),
+):
+    """글 전체 또는 한 섹션을 요청대로 고쳐 스트리밍"""
+    api_key = _resolve_api_key(body)
+    return _stream_response(
+        revise_article_stream,
+        {"markdown": body.markdown, "instruction": body.instruction, "section": body.section, "api_key": api_key},
+    )
+
+
+# ---------- 생성 이력 ----------
+
+class HistoryUpdateRequest(BaseModel):
+    markdown: str
+
+    @field_validator("markdown")
+    @classmethod
+    def validate_markdown(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("저장할 내용이 없습니다.")
+        return v
+
+
+@app.get("/api/history")
+def api_history_list(
+    q: Optional[str] = Query(None, max_length=100, description="제목·키워드 검색어"),
+    limit: int = Query(30, ge=1, le=100),
+):
+    """최근 생성한 글 목록"""
+    return {"items": history.list_recent(q.strip() if q else None, limit)}
+
+
+@app.get("/api/history/check")
+def api_history_check(keyword: str = Query(..., min_length=1, max_length=100)):
+    """같은 키워드로 쓴 글이 있는지 확인 (중복 알림용)"""
+    return {"items": history.find_by_keyword(keyword)}
+
+
+@app.get("/api/history/{article_id}")
+def api_history_get(article_id: int):
+    item = history.get(article_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="해당 글을 찾을 수 없습니다.")
+    return item
+
+
+@app.put("/api/history/{article_id}")
+def api_history_update(article_id: int, body: HistoryUpdateRequest):
+    """다듬은 글로 이력 본문 갱신"""
+    if not history.update_markdown(article_id, body.markdown):
+        raise HTTPException(status_code=404, detail="해당 글을 찾을 수 없습니다.")
+    return {"success": True}
+
+
+@app.delete("/api/history/{article_id}")
+def api_history_delete(article_id: int):
+    if not history.delete(article_id):
+        raise HTTPException(status_code=404, detail="해당 글을 찾을 수 없습니다.")
+    return {"success": True}
 
 
 class MetaRequest(BaseModel):

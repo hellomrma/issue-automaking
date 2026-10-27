@@ -261,3 +261,69 @@ class TestSaveMarkdown:
         for _ in range(save_limiter.requests_per_minute):
             assert client.post("/api/save-markdown", json={"content": "# 글"}).status_code == 200
         assert client.post("/api/save-markdown", json={"content": "# 글"}).status_code == 429
+
+
+class TestStreamHistoryAndRevise:
+    """스트리밍 생성 → 이력 기록, 글 다듬기"""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        from app.rate_limit import generate_limiter
+
+        generate_limiter.requests.clear()
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-1234567890")
+
+    def test_stream_saves_history(self, monkeypatch):
+        from app import history
+
+        monkeypatch.setattr("app.main.generate_article_md_stream", lambda **k: iter(["# 제목\n", "본문"]))
+        res = client.post("/api/generate/stream", json={"keyword": "테스트 키워드", "use_web_search": False})
+        article_id = int(res.headers["x-history-id"])
+        item = history.get(article_id)
+        assert item["markdown"] == "# 제목\n본문"
+        assert item["keyword"] == "테스트 키워드"
+
+    def test_stream_error_without_text_removes_history(self, monkeypatch):
+        from app import history
+
+        def _fail(**kwargs):
+            raise RuntimeError("실패")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr("app.main.generate_article_md_stream", _fail)
+        res = client.post("/api/generate/stream", json={"keyword": "테스트", "use_web_search": False})
+        assert "[ERROR]" in res.text
+        assert history.get(int(res.headers["x-history-id"])) is None
+
+    def test_claude_search_skips_duckduckgo(self, monkeypatch):
+        monkeypatch.setattr("app.main.search_web", lambda *a, **k: pytest.fail("DuckDuckGo should not be called"))
+        captured = {}
+
+        def _gen(**kwargs):
+            captured.update(kwargs)
+            return "# 글"
+
+        monkeypatch.setattr("app.main.generate_article_md", _gen)
+        res = client.post("/api/generate", json={"keyword": "테스트", "use_claude_search": True})
+        assert res.status_code == 200
+        assert captured["claude_search"] is True
+        assert res.json()["history_id"] is not None
+
+    def test_revise_passes_section(self, monkeypatch):
+        captured = {}
+
+        def _revise(**kwargs):
+            captured.update(kwargs)
+            yield "## 고친 섹션"
+
+        monkeypatch.setattr("app.main.revise_article_stream", _revise)
+        res = client.post("/api/revise/stream", json={
+            "markdown": "# 글\n## 섹션\n내용", "instruction": "더 짧게", "section": "## 섹션\n내용",
+        })
+        assert res.text == "## 고친 섹션"
+        assert captured["section"] == "## 섹션\n내용"
+        assert "x-history-id" not in res.headers
+
+    def test_revise_requires_instruction(self):
+        res = client.post("/api/revise/stream", json={"markdown": "# 글", "instruction": "  "})
+        assert res.status_code == 422

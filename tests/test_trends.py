@@ -93,3 +93,25 @@ class TestGetTrendingKeywords:
         keywords, source, *_ = get_trending_keywords("unknown_region", 5)
         # 폴백이든 실제 데이터든 반환되어야 함
         assert isinstance(keywords, list)
+
+
+class TestTrendNews:
+    def test_parse_news_filters_and_limits(self):
+        from app.trends import _parse_news
+
+        articles = [
+            {"headline": "기사1", "url": "https://a.com/1", "source": "A"},
+            {"headline": "", "url": "https://a.com/2"},
+            {"headline": "위험", "url": "javascript:alert(1)"},
+            {"headline": "기사2", "url": "https://a.com/3"},
+            {"headline": "기사3", "url": "http://a.com/4"},
+            {"headline": "기사4", "url": "https://a.com/5"},
+        ]
+        news = _parse_news(articles)
+        assert [n["headline"] for n in news] == ["기사1", "기사2", "기사3"]
+
+    def test_get_trend_news(self, monkeypatch):
+        from app import trends
+
+        monkeypatch.setattr(trends, "_trend_news", {"키워드": [{"headline": "h", "url": "https://x", "source": ""}]})
+        assert trends.get_trend_news(["키워드", "없음"]) == {"키워드": [{"headline": "h", "url": "https://x", "source": ""}]}

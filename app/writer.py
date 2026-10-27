@@ -84,6 +84,25 @@ def _context_block(intro: str, content: Optional[str]) -> str:
 _SEARCH_INTRO = "아래는 {subject}에 대한 최신 웹 검색 결과와 **뉴스 기사**입니다. 뉴스(일반 뉴스·구글 뉴스 등)를 특히 참고하여 **최신 동향·숫자·사실·시사**를 반영하고, 독자가 관심 가질 만한 시의성 있는 내용을 담아 주세요. 원문을 그대로 복사하지 말고 재해석하여 자연스럽게 활용하세요."
 _GUIDE_INTRO = "아래는 사용자가 요청한 **글 작성 가이드**입니다. 이 가이드를 최우선으로 반영하여 글을 작성해 주세요:"
 _REFERENCE_INTRO = "아래는 **참고해야 할 URL의 콘텐츠**입니다. 이 내용을 참고하여 글을 작성해 주세요. 원문을 그대로 복사하지 말고 참고만 하세요:"
+_CLAUDE_SEARCH_INSTRUCTION = """
+
+web_search 도구로 {subject}의 최신 뉴스와 정보를 찾아 **최신 동향·숫자·사실·시사**를 반영해 주세요. 검색 과정이나 "검색해 보겠습니다" 같은 말 없이 완성된 글만 출력하세요.
+"""
+_SOURCES_INSTRUCTION = """
+
+출처 표기: 해시태그 줄 바로 위에 `## 참고한 자료` 소제목을 두고, 본문에 실제로 반영한 자료만 최대 3개를 `- [기사·페이지 제목](URL)` 형식의 목록으로 적어 주세요. URL은 위에 주어진 자료나 검색 결과에 실제로 있는 것만 쓰고, 지어내지 마세요.
+"""
+
+# Claude 서버 측 웹 검색 도구 (검색은 요청당 최대 5회)
+_WEB_SEARCH_TOOL = {
+    "type": "web_search_20260209",
+    "name": "web_search",
+    "max_uses": 5,
+    "user_location": {"type": "approximate", "country": "KR", "timezone": "Asia/Seoul"},
+}
+
+# pause_turn(서버 측 검색 루프 일시 정지) 이어받기 최대 횟수
+_MAX_PAUSE_RESUMES = 3
 
 
 def _build_prompts(
@@ -95,6 +114,8 @@ def _build_prompts(
     length: str = "medium",
     guide: Optional[str] = None,
     reference_content: Optional[str] = None,
+    include_sources: bool = True,
+    claude_search: bool = False,
 ) -> tuple[str, str]:
     """시스템 프롬프트와 사용자 프롬프트를 생성합니다."""
     user = f"""다음 키워드를 주제로 티스토리 블로그 글을 마크다운으로 작성해 주세요.
@@ -105,6 +126,11 @@ def _build_prompts(
     user += _context_block(_SEARCH_INTRO.format(subject="이 키워드"), web_context)
     user += _context_block(_GUIDE_INTRO, guide)
     user += _context_block(_REFERENCE_INTRO, (reference_content or "")[:4000])
+    if claude_search:
+        user += _CLAUDE_SEARCH_INSTRUCTION.format(subject=f"'{keyword}'")
+    # 출처로 쓸 자료가 있을 때만 출처 표기를 요청
+    if include_sources and ((web_context or "").strip() or (reference_content or "").strip() or claude_search):
+        user += _SOURCES_INSTRUCTION
     return _SYSTEM, user
 
 
@@ -116,6 +142,8 @@ def _build_url_prompts(
     related_search: str = "",
     length: str = "medium",
     guide: Optional[str] = None,
+    include_sources: bool = True,
+    claude_search: bool = False,
 ) -> tuple[str, str]:
     """URL 콘텐츠 기반 블로그 글 생성을 위한 프롬프트를 생성합니다."""
     url_info = f"URL: {url_content.get('url', '')}"
@@ -140,6 +168,10 @@ def _build_url_prompts(
 """
     user += _context_block(_SEARCH_INTRO.format(subject="이 주제와 관련된 내용"), related_search)
     user += _context_block(_GUIDE_INTRO, guide)
+    if claude_search:
+        user += _CLAUDE_SEARCH_INSTRUCTION.format(subject="이 주제")
+    if include_sources:
+        user += _SOURCES_INSTRUCTION
     return _SYSTEM, user
 
 
@@ -155,29 +187,45 @@ def _get_model() -> str:
     return (os.getenv("CLAUDE_MODEL") or "").strip() or DEFAULT_MODEL
 
 
-def _stream_text(system: str, user: str, api_key: Optional[str]) -> Generator[str, None, None]:
-    """Claude 응답 텍스트를 스트리밍. 출력 한도로 잘리면 TRUNCATED_NOTICE를 덧붙입니다."""
+def _stream_text(
+    system: str, user: str, api_key: Optional[str], *, web_search: bool = False
+) -> Generator[str, None, None]:
+    """
+    Claude 응답 텍스트를 스트리밍. 출력 한도로 잘리면 TRUNCATED_NOTICE를 덧붙입니다.
+    web_search: True면 Claude 서버 측 웹 검색 도구를 사용 (pause_turn 시 이어서 요청)
+    """
     client = Anthropic(api_key=api_key or None)
     model = _get_model()
     extra = {}
     if model in _FALLBACK_MODELS:
         extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
+    if web_search:
+        extra["tools"] = [_WEB_SEARCH_TOOL]
 
-    with client.beta.messages.stream(
-        model=model,
-        max_tokens=_MAX_TOKENS,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-        **extra,
-    ) as stream:
-        yield from stream.text_stream
-        final = stream.get_final_message()
+    messages = [{"role": "user", "content": user}]
+    for _ in range(_MAX_PAUSE_RESUMES + 1):
+        with client.beta.messages.stream(
+            model=model,
+            max_tokens=_MAX_TOKENS,
+            system=system,
+            messages=messages,
+            **extra,
+        ) as stream:
+            yield from stream.text_stream
+            final = stream.get_final_message()
+        if final.stop_reason != "pause_turn":
+            break
+        # 서버 측 검색 루프가 멈춘 경우: 지금까지의 응답을 그대로 돌려보내면 이어서 진행
+        messages = [{"role": "user", "content": user}, {"role": "assistant", "content": final.content}]
 
     if final.stop_reason == "max_tokens":
         logger.warning("출력 한도(max_tokens=%d) 도달: model=%s", _MAX_TOKENS, model)
         yield f"\n\n{TRUNCATED_NOTICE}"
     elif final.stop_reason == "refusal":
         raise RuntimeError("Claude가 이 주제의 글 작성을 거절했습니다. 다른 키워드로 시도해 주세요.")
+    elif final.stop_reason == "pause_turn":
+        logger.warning("웹 검색이 %d회 이어받기 후에도 끝나지 않음", _MAX_PAUSE_RESUMES)
+        yield f"\n\n{TRUNCATED_NOTICE}"
 
 
 def generate_article_md_stream(
@@ -191,15 +239,22 @@ def generate_article_md_stream(
     length: str = "medium",
     guide: Optional[str] = None,
     reference_content: Optional[str] = None,
+    include_sources: bool = True,
+    claude_search: bool = False,
 ) -> Generator[str, None, None]:
     """
     키워드를 바탕으로 티스토리용 마크다운 블로그 글을 스트리밍으로 생성합니다.
     length: short | medium | long
     guide: 사용자가 원하는 글 작성 방향/톤/포함할 내용
     reference_content: 참고할 URL의 콘텐츠
+    include_sources: True면 글 끝에 '참고한 자료' 출처 링크 포함
+    claude_search: True면 Claude 웹 검색 도구로 최신 정보 검색
     """
-    system, user = _build_prompts(keyword, lang, style, use_emoji, web_context, length, guide, reference_content)
-    yield from _stream_text(system, user, api_key)
+    system, user = _build_prompts(
+        keyword, lang, style, use_emoji, web_context, length, guide, reference_content,
+        include_sources, claude_search,
+    )
+    yield from _stream_text(system, user, api_key, web_search=claude_search)
 
 
 def generate_article_md(keyword: str, **kwargs) -> str:
@@ -222,14 +277,19 @@ def generate_article_from_url_stream(
     related_search: Optional[str] = None,
     length: str = "medium",
     guide: Optional[str] = None,
+    include_sources: bool = True,
+    claude_search: bool = False,
 ) -> Generator[str, None, None]:
     """
     URL 콘텐츠를 기반으로 티스토리용 마크다운 블로그 글을 스트리밍으로 생성합니다.
     url_content: fetch_url_content()에서 반환된 dict
     related_search: 관련 웹 검색 결과 텍스트
     """
-    system, user = _build_url_prompts(url_content, lang, style, use_emoji, related_search or "", length, guide)
-    yield from _stream_text(system, user, api_key)
+    system, user = _build_url_prompts(
+        url_content, lang, style, use_emoji, related_search or "", length, guide,
+        include_sources, claude_search,
+    )
+    yield from _stream_text(system, user, api_key, web_search=claude_search)
 
 
 def generate_article_from_url(url_content: dict, **kwargs) -> str:
@@ -238,6 +298,46 @@ def generate_article_from_url(url_content: dict, **kwargs) -> str:
     인자는 generate_article_from_url_stream()과 동일합니다.
     """
     return _clean_markdown("".join(generate_article_from_url_stream(url_content, **kwargs)).strip())
+
+
+# ---------- 글 다듬기 ----------
+
+def revise_article_stream(
+    markdown: str,
+    instruction: str,
+    *,
+    section: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Generator[str, None, None]:
+    """
+    완성된 글을 요청대로 고쳐 씁니다.
+    section이 있으면 그 부분만 고쳐서 그 부분만 출력하고, 없으면 글 전체를 출력합니다.
+    """
+    if section:
+        target = f"""아래 [전체 글] 중 [고칠 부분]만 요청대로 고쳐 주세요.
+- 고친 [고칠 부분]만 출력하세요. 다른 부분이나 설명은 출력하지 마세요.
+- [고칠 부분]이 ## 소제목으로 시작하면, 고친 글도 ## 소제목 줄로 시작하세요.
+- 앞뒤 문단과 자연스럽게 이어지도록 글의 톤과 형식을 유지하세요.
+
+[고칠 부분]
+---
+{section}
+---"""
+    else:
+        target = """아래 [전체 글]을 요청대로 고쳐 주세요.
+- 고친 글 전체를 출력하세요. 설명은 붙이지 마세요.
+- 요청과 관계없는 부분, # 제목 형식, 끝의 해시태그 줄과 참고한 자료 목록은 그대로 유지하세요."""
+
+    user = f"""{target}
+
+[요청]
+{instruction}
+
+[전체 글]
+---
+{markdown}
+---"""
+    yield from _stream_text(_SYSTEM, user, api_key)
 
 
 # ---------- 제목 후보 · SEO 메타 설명 ----------

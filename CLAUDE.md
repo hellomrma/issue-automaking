@@ -21,7 +21,8 @@ app/
 ├── main.py          # FastAPI 앱, API 엔드포인트 정의
 ├── writer.py        # Claude API를 이용한 글 생성 로직
 ├── trends.py        # Google Trends 키워드 수집 (캐시 포함)
-├── search.py        # DuckDuckGo 웹/뉴스 검색, URL 콘텐츠 추출
+├── search.py        # DuckDuckGo 웹/뉴스 검색, URL 콘텐츠 추출 (SSRF 방어)
+├── history.py       # 생성 이력 저장 (SQLite, data/history.db)
 └── rate_limit.py    # 인메모리 Rate Limiter
 
 static/
@@ -30,7 +31,11 @@ static/
 └── style.css        # 스타일
 
 tests/
+├── conftest.py      # 테스트마다 임시 이력 DB 사용
 ├── test_api.py      # API 엔드포인트 테스트
+├── test_history.py  # 생성 이력 테스트
+├── test_search.py   # URL 수집·SSRF 차단 테스트
+├── test_writer.py   # 프롬프트·Claude 호출 테스트 (모킹)
 ├── test_trends.py   # 트렌드 수집 테스트
 └── test_rate_limit.py # Rate Limiter 테스트
 ```
@@ -40,20 +45,25 @@ tests/
 ### app/main.py
 - FastAPI 앱 인스턴스 및 모든 API 엔드포인트 정의
 - `GenerateRequest`, `GenerateFromUrlRequest`: Pydantic 모델로 요청 검증
-- Rate Limiting: `generate_limiter` (분당 5회), `trends_limiter` (분당 20회)
+- Rate Limiting: `generate_limiter` (분당 5회), `trends_limiter` (분당 20회), `save_limiter` (분당 20회)
+- 스트리밍 생성은 이력에 기록하고 `X-History-Id` 응답 헤더로 id 전달
 
 ### app/writer.py
 - `generate_article_md()`: 키워드 기반 마크다운 글 생성
 - `generate_article_md_stream()`: 스트리밍 버전
 - `generate_article_from_url()`: URL 콘텐츠 기반 글 생성
 - `generate_article_from_url_stream()`: 스트리밍 버전
-- `_build_prompts()`, `_build_url_prompts()`: 프롬프트 생성 헬퍼
+- `revise_article_stream()`: 글 전체 또는 한 섹션 다듬기
+- `generate_article_meta()`: 제목 후보·SEO 메타 설명 (구조화 출력)
+- `_build_prompts()`, `_build_url_prompts()`: 프롬프트 생성 헬퍼 (출처 표기·Claude 웹 검색 지시 포함)
+- `_stream_text()`: Claude 호출 공통부 (거절 폴백, 웹 검색 도구, pause_turn 이어받기)
 
 ### app/trends.py
 - `get_trending_keywords()`: Google Trends 키워드 수집
 - `TrendsCache`: 10분 TTL 인메모리 캐시
 - `REGIONS`: 지원 지역 (현재 한국만)
 - `FALLBACK_KEYWORDS`: RSS 실패 시 사용할 예시 키워드
+- `get_trend_news()`: RSS 키워드별 관련 뉴스 헤드라인
 
 ### app/search.py
 - `search_web()`: DuckDuckGo 웹 검색 + 뉴스 검색
@@ -84,6 +94,7 @@ python -m pip install -r requirements.txt
 | `CLAUDE_MODEL` | X | 사용할 Claude 모델 (기본: claude-sonnet-5-5) |
 | `USE_CSV_TRENDS` | X | CSV 트렌드 수집 활성화 (기본: false) |
 | `TRUST_PROXY` | X | 리버스 프록시 뒤에서 X-Forwarded-For로 클라이언트 식별 (기본: false) |
+| `HISTORY_DB` | X | 생성 이력 SQLite 경로 (기본: data/history.db) |
 
 ## API 엔드포인트
 
@@ -94,6 +105,11 @@ python -m pip install -r requirements.txt
 - `POST /api/generate-from-url`: URL 기반 글 생성
 - `POST /api/generate-from-url/stream`: URL 기반 글 스트리밍 생성
 - `POST /api/meta`: 생성된 글의 제목 후보·SEO 메타 설명 생성
+- `POST /api/revise/stream`: 글 전체 또는 한 섹션 다듬기 (스트리밍)
+- `GET /api/history`: 지난 글 목록 (`q`로 제목·키워드 검색)
+- `GET /api/history/check`: 같은 키워드로 쓴 글 확인
+- `GET|PUT|DELETE /api/history/{id}`: 지난 글 조회·수정·삭제
+- `POST /api/save-markdown`: downloads 폴더에 .md 저장
 
 ## 코드 스타일
 
