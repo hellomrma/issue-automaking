@@ -249,18 +249,21 @@ fieldset { margin: 0; padding: 0; border: 0; }
   left: 10px;
 }
 
-.lengths label {
+.lengths label,
+.provider label {
   flex: 1;
   cursor: pointer;
 }
 
-.lengths input {
+.lengths input,
+.provider input {
   position: absolute;
   opacity: 0;
   pointer-events: none;
 }
 
-.lengths span {
+.lengths span,
+.provider span:not(.provider-model) {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -272,13 +275,15 @@ fieldset { margin: 0; padding: 0; border: 0; }
 
 .lengths small { font-size: 0.75rem; }
 
-.lengths input:checked + span {
+.lengths input:checked + span,
+.provider input:checked + span {
   color: var(--ink);
   font-weight: 600;
   background: var(--paper-deep);
 }
 
-.lengths input:focus-visible + span {
+.lengths input:focus-visible + span,
+.provider input:focus-visible + span {
   outline: 2px solid var(--green);
   outline-offset: 1px;
 }
@@ -877,4 +882,21 @@ input[type="search"] { width: 100%; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
   .output.streaming::after { animation: none; }
+}
+
+/* 쓰는 AI 선택 */
+.provider {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.provider legend { float: left; padding: 0; }
+.provider .segmented { padding: 3px; }
+
+.provider-model {
+  grid-column: 2;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
 }

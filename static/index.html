@@ -108,17 +108,30 @@
             <summary>세부 설정</summary>
             <div class="checks">
               <label><input type="checkbox" id="useWebSearch" checked /> 최신 뉴스·검색 결과 반영</label>
-              <label class="check-sub"><input type="checkbox" id="useClaudeSearch" /> Claude가 직접 웹 검색 <span class="optional">더 정확하지만 검색 1,000회당 약 $10 추가</span></label>
+              <label class="check-sub"><input type="checkbox" id="useClaudeSearch" /> Claude가 직접 웹 검색 <span class="optional" id="claudeSearchHint">더 정확하지만 검색 1,000회당 약 $10 추가</span></label>
               <label><input type="checkbox" id="includeSources" checked /> 글 끝에 참고한 자료 링크 넣기</label>
               <label><input type="checkbox" id="useEmoji" checked /> 이모지 넣기</label>
             </div>
-            <label class="field">
-              <span class="field-label">Claude API 키 <span class="optional">비워 두면 서버 설정 사용</span></span>
+            <label class="field" id="claudeKeyField">
+              <span class="field-label">Claude API 키 <span class="optional key-hint">비워 두면 서버 설정 사용</span></span>
               <input type="password" id="apiKey" placeholder="sk-ant-..." autocomplete="off" />
+            </label>
+            <label class="field hidden" id="openaiKeyField">
+              <span class="field-label">OpenAI API 키 <span class="optional key-hint">비워 두면 서버 설정 사용</span></span>
+              <input type="password" id="openaiKey" placeholder="sk-..." autocomplete="off" />
             </label>
             <label class="check-inline"><input type="checkbox" id="saveKey" /> 이 탭을 닫을 때까지 키 기억하기</label>
           </details>
         </div>
+
+        <fieldset class="provider">
+          <legend class="field-label">쓰는 AI</legend>
+          <div class="segmented">
+            <label><input type="radio" name="provider" value="claude" checked /><span>Claude</span></label>
+            <label><input type="radio" name="provider" value="openai" /><span>OpenAI</span></label>
+          </div>
+          <span id="providerModel" class="provider-model"></span>
+        </fieldset>
 
         <div class="generate-bar">
           <button type="button" id="generate" class="btn btn-primary">글 생성</button>

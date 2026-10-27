@@ -24,6 +24,12 @@ const EL = {
   includeSources: document.getElementById("includeSources"),
   useEmoji: document.getElementById("useEmoji"),
   apiKey: document.getElementById("apiKey"),
+  openaiKey: document.getElementById("openaiKey"),
+  claudeKeyField: document.getElementById("claudeKeyField"),
+  openaiKeyField: document.getElementById("openaiKeyField"),
+  providerRadios: document.querySelectorAll('input[name="provider"]'),
+  providerModel: document.getElementById("providerModel"),
+  claudeSearchHint: document.getElementById("claudeSearchHint"),
   saveKey: document.getElementById("saveKey"),
   generate: document.getElementById("generate"),
   cancelGenerate: document.getElementById("cancelGenerate"),
@@ -94,6 +100,10 @@ function getRadioValue(name, fallback) {
 let currentAbortController = null;
 
 const STORAGE_KEY = "tistory_writer_anthropic_key";
+const OPENAI_STORAGE_KEY = "tistory_writer_openai_key";
+
+// 서버 설정 (/api/config): 제공자별 모델과 서버 키 설정 여부
+let providerConfig = {};
 
 const API_OFF_MSG = "API 서버에 연결되지 않았습니다. run.bat을 실행한 뒤 주소창에 http://localhost:8000 으로 접속해 주세요.";
 
@@ -135,6 +145,8 @@ function loadStoredApiKey() {
     // sessionStorage 사용 (브라우저 세션 종료 시 자동 삭제)
     const v = sessionStorage.getItem(STORAGE_KEY);
     if (v && EL.apiKey) EL.apiKey.value = v;
+    const o = sessionStorage.getItem(OPENAI_STORAGE_KEY);
+    if (o && EL.openaiKey) EL.openaiKey.value = o;
   } catch (_) {}
 }
 
@@ -143,18 +155,27 @@ function saveApiKey() {
   try {
     // sessionStorage 사용 (localStorage보다 안전)
     sessionStorage.setItem(STORAGE_KEY, EL.apiKey?.value || "");
+    sessionStorage.setItem(OPENAI_STORAGE_KEY, EL.openaiKey?.value || "");
   } catch (_) {}
 }
 
 function clearApiKey() {
   try {
     sessionStorage.removeItem(STORAGE_KEY);
+    sessionStorage.removeItem(OPENAI_STORAGE_KEY);
   } catch (_) {}
 }
 
+function getProvider() {
+  return getRadioValue("provider", "claude");
+}
+
+// 요청 body에 선택한 AI와 그 AI의 키(입력했을 때만)를 붙임
 function withApiKey(body) {
-  const key = (EL.apiKey?.value || "").trim();
-  if (key) body.anthropic_api_key = key;
+  const provider = getProvider();
+  body.provider = provider;
+  const key = ((provider === "openai" ? EL.openaiKey?.value : EL.apiKey?.value) || "").trim();
+  if (key) body[provider === "openai" ? "openai_api_key" : "anthropic_api_key"] = key;
   return body;
 }
 
@@ -431,11 +452,48 @@ function checkDuplicate(keyword) {
 
 EL.keyword?.addEventListener("input", () => checkDuplicate(EL.keyword.value));
 
-// Claude 웹 검색은 '최신 뉴스·검색 결과 반영'이 켜져 있을 때만 의미가 있음
+// Claude 웹 검색은 Claude를 쓰고 '최신 뉴스·검색 결과 반영'이 켜져 있을 때만 의미가 있음
 function syncSearchOptions() {
-  EL.useClaudeSearch.disabled = !EL.useWebSearch.checked;
+  const isClaude = getProvider() === "claude";
+  EL.useClaudeSearch.disabled = !EL.useWebSearch.checked || !isClaude;
+  EL.claudeSearchHint.textContent = isClaude
+    ? "더 정확하지만 검색 1,000회당 약 $10 추가"
+    : "Claude를 고를 때만 쓸 수 있습니다";
 }
 EL.useWebSearch?.addEventListener("change", syncSearchOptions);
+
+// 선택한 AI에 맞춰 키 입력칸·모델 안내 전환
+function syncProviderUI() {
+  const provider = getProvider();
+  EL.claudeKeyField.classList.toggle("hidden", provider !== "claude");
+  EL.openaiKeyField.classList.toggle("hidden", provider !== "openai");
+  const info = providerConfig[provider];
+  if (info) {
+    const typedKey = (provider === "openai" ? EL.openaiKey.value : EL.apiKey.value).trim();
+    const keyNote = info.has_server_key || typedKey ? "" : " · API 키 입력 필요";
+    EL.providerModel.textContent = `모델 ${info.model}${keyNote}`;
+    const field = provider === "openai" ? EL.openaiKeyField : EL.claudeKeyField;
+    field.querySelector(".key-hint").textContent = info.has_server_key
+      ? "비워 두면 서버 설정 사용"
+      : "서버에 키가 없어 입력해야 합니다";
+  }
+  syncSearchOptions();
+}
+EL.providerRadios.forEach((r) => r.addEventListener("change", syncProviderUI));
+[EL.apiKey, EL.openaiKey].forEach((input) => input?.addEventListener("input", syncProviderUI));
+
+async function loadConfig() {
+  try {
+    const res = await fetch("/api/config");
+    const data = parseJsonOrFail(await res.text());
+    providerConfig = data.providers || {};
+    const radio = document.querySelector(`input[name="provider"][value="${data.default_provider}"]`);
+    if (radio) radio.checked = true;
+  } catch (_) {
+    // 설정을 못 받아도 기본값(Claude)으로 동작
+  }
+  syncProviderUI();
+}
 
 // ---------- 3. 글 생성 (스트리밍) ----------
 
@@ -1053,7 +1111,8 @@ document.addEventListener("keydown", (e) => {
 });
 
 loadStoredApiKey();
-syncSearchOptions();
+syncProviderUI();
+loadConfig();
 refreshHistory();
 // 좁은 화면에서는 원고가 아래로 밀리지 않게 지난 글을 접어 둠
 if (window.matchMedia("(max-width: 900px)").matches) {

@@ -4,12 +4,24 @@ import os
 from typing import Generator, Optional
 
 from anthropic import Anthropic
-from pydantic import BaseModel
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger("app.writer")
 
 # 모델 ID. 환경변수 CLAUDE_MODEL 로 변경 가능 (예: claude-haiku-5-5)
 DEFAULT_MODEL = "claude-sonnet-5-5"
+
+# OpenAI 모델 ID. 환경변수 OPENAI_MODEL 로 변경 가능
+DEFAULT_OPENAI_MODEL = "gpt-5"
+
+# 지원하는 AI 제공자. 요청에 지정이 없으면 환경변수 LLM_PROVIDER (기본 claude)
+PROVIDERS = ("claude", "openai")
+
+
+def default_provider() -> str:
+    value = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+    return value if value in PROVIDERS else "claude"
 
 # 서버 측 거절(refusal) 폴백("default")을 지원하는 모델
 _FALLBACK_MODELS = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1"}
@@ -187,13 +199,54 @@ def _get_model() -> str:
     return (os.getenv("CLAUDE_MODEL") or "").strip() or DEFAULT_MODEL
 
 
+def _get_openai_model() -> str:
+    return (os.getenv("OPENAI_MODEL") or "").strip() or DEFAULT_OPENAI_MODEL
+
+
+def get_model(provider: str) -> str:
+    """제공자별 현재 사용 모델 ID"""
+    return _get_openai_model() if provider == "openai" else _get_model()
+
+
+def _stream_text_openai(system: str, user: str, api_key: Optional[str]) -> Generator[str, None, None]:
+    """OpenAI(Chat Completions) 응답 텍스트를 스트리밍. 출력 한도로 잘리면 TRUNCATED_NOTICE를 덧붙입니다."""
+    client = OpenAI(api_key=api_key or None)
+    model = _get_openai_model()
+    stream = client.chat.completions.create(
+        model=model,
+        max_completion_tokens=_MAX_TOKENS,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        stream=True,
+    )
+    finish_reason = None
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        if choice.delta and choice.delta.content:
+            yield choice.delta.content
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    if finish_reason == "length":
+        logger.warning("출력 한도(max_completion_tokens=%d) 도달: model=%s", _MAX_TOKENS, model)
+        yield f"\n\n{TRUNCATED_NOTICE}"
+    elif finish_reason == "content_filter":
+        raise RuntimeError("OpenAI가 이 주제의 글 작성을 거절했습니다. 다른 키워드로 시도해 주세요.")
+
+
 def _stream_text(
-    system: str, user: str, api_key: Optional[str], *, web_search: bool = False
+    system: str, user: str, api_key: Optional[str], *, web_search: bool = False, provider: str = "claude"
 ) -> Generator[str, None, None]:
     """
-    Claude 응답 텍스트를 스트리밍. 출력 한도로 잘리면 TRUNCATED_NOTICE를 덧붙입니다.
-    web_search: True면 Claude 서버 측 웹 검색 도구를 사용 (pause_turn 시 이어서 요청)
+    AI 응답 텍스트를 스트리밍. 출력 한도로 잘리면 TRUNCATED_NOTICE를 덧붙입니다.
+    web_search: True면 Claude 서버 측 웹 검색 도구를 사용 (pause_turn 시 이어서 요청, Claude 전용)
+    provider: claude | openai
     """
+    if provider == "openai":
+        yield from _stream_text_openai(system, user, api_key)
+        return
+
     client = Anthropic(api_key=api_key or None)
     model = _get_model()
     extra = {}
@@ -241,6 +294,7 @@ def generate_article_md_stream(
     reference_content: Optional[str] = None,
     include_sources: bool = True,
     claude_search: bool = False,
+    provider: str = "claude",
 ) -> Generator[str, None, None]:
     """
     키워드를 바탕으로 티스토리용 마크다운 블로그 글을 스트리밍으로 생성합니다.
@@ -248,20 +302,21 @@ def generate_article_md_stream(
     guide: 사용자가 원하는 글 작성 방향/톤/포함할 내용
     reference_content: 참고할 URL의 콘텐츠
     include_sources: True면 글 끝에 '참고한 자료' 출처 링크 포함
-    claude_search: True면 Claude 웹 검색 도구로 최신 정보 검색
+    claude_search: True면 Claude 웹 검색 도구로 최신 정보 검색 (Claude 전용)
+    provider: claude | openai
     """
     system, user = _build_prompts(
         keyword, lang, style, use_emoji, web_context, length, guide, reference_content,
         include_sources, claude_search,
     )
-    yield from _stream_text(system, user, api_key, web_search=claude_search)
+    yield from _stream_text(system, user, api_key, web_search=claude_search, provider=provider)
 
 
 def generate_article_md(keyword: str, **kwargs) -> str:
     """
     키워드를 바탕으로 티스토리용 마크다운 블로그 글을 생성합니다.
     인자는 generate_article_md_stream()과 동일합니다.
-    api_key: Anthropic(Claude) API 키 (None이면 환경변수 ANTHROPIC_API_KEY 사용)
+    api_key: 제공자의 API 키 (None이면 환경변수 ANTHROPIC_API_KEY / OPENAI_API_KEY 사용)
     web_context: 최신 웹 검색 결과 텍스트. 있으면 이를 참고해 최신 정보를 반영
     """
     return _clean_markdown("".join(generate_article_md_stream(keyword, **kwargs)).strip())
@@ -279,6 +334,7 @@ def generate_article_from_url_stream(
     guide: Optional[str] = None,
     include_sources: bool = True,
     claude_search: bool = False,
+    provider: str = "claude",
 ) -> Generator[str, None, None]:
     """
     URL 콘텐츠를 기반으로 티스토리용 마크다운 블로그 글을 스트리밍으로 생성합니다.
@@ -289,7 +345,7 @@ def generate_article_from_url_stream(
         url_content, lang, style, use_emoji, related_search or "", length, guide,
         include_sources, claude_search,
     )
-    yield from _stream_text(system, user, api_key, web_search=claude_search)
+    yield from _stream_text(system, user, api_key, web_search=claude_search, provider=provider)
 
 
 def generate_article_from_url(url_content: dict, **kwargs) -> str:
@@ -308,6 +364,7 @@ def revise_article_stream(
     *,
     section: Optional[str] = None,
     api_key: Optional[str] = None,
+    provider: str = "claude",
 ) -> Generator[str, None, None]:
     """
     완성된 글을 요청대로 고쳐 씁니다.
@@ -337,7 +394,7 @@ def revise_article_stream(
 ---
 {markdown}
 ---"""
-    yield from _stream_text(_SYSTEM, user, api_key)
+    yield from _stream_text(_SYSTEM, user, api_key, provider=provider)
 
 
 # ---------- 제목 후보 · SEO 메타 설명 ----------
@@ -348,9 +405,30 @@ class ArticleMeta(BaseModel):
     meta_description: str
 
 
-def generate_article_meta(markdown: str, *, api_key: Optional[str] = None) -> ArticleMeta:
+def _generate_meta_openai(prompt: str, api_key: Optional[str]) -> ArticleMeta:
+    """OpenAI JSON 모드로 메타 정보 생성"""
+    client = OpenAI(api_key=api_key or None)
+    resp = client.chat.completions.create(
+        model=_get_openai_model(),
+        max_completion_tokens=_MAX_TOKENS,
+        response_format={"type": "json_object"},
+        messages=[{
+            "role": "user",
+            "content": prompt + '\n\n{"titles": ["..."], "meta_description": "..."} 형식의 JSON 객체만 출력하세요.',
+        }],
+    )
+    content = resp.choices[0].message.content if resp.choices else None
+    try:
+        return ArticleMeta.model_validate_json(content or "")
+    except ValidationError:
+        finish = resp.choices[0].finish_reason if resp.choices else None
+        raise RuntimeError(f"메타 정보를 생성하지 못했습니다. (finish_reason={finish})")
+
+
+def generate_article_meta(
+    markdown: str, *, api_key: Optional[str] = None, provider: str = "claude"
+) -> ArticleMeta:
     """완성된 글을 바탕으로 제목 후보 5개와 SEO 메타 설명을 생성합니다."""
-    client = Anthropic(api_key=api_key or None)
     prompt = f"""다음 티스토리 블로그 글에 어울리는 메타 정보를 만들어 주세요.
 
 - titles: 클릭하고 싶어지는 제목 후보 5개 (각 20~40자, 핵심 키워드를 앞쪽에 배치, 과장·낚시성 표현 금지)
@@ -359,6 +437,10 @@ def generate_article_meta(markdown: str, *, api_key: Optional[str] = None) -> Ar
 --- 글 ---
 {markdown[:8000]}
 ---"""
+    if provider == "openai":
+        return _generate_meta_openai(prompt, api_key)
+
+    client = Anthropic(api_key=api_key or None)
     resp = client.messages.parse(
         model=_get_model(),
         max_tokens=_MAX_TOKENS,

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Callable, Iterator, Optional
 
 import anthropic
+import openai
 from dotenv import load_dotenv
 
 logger = logging.getLogger("app.main")
@@ -18,12 +19,15 @@ from app.search import fetch_url_content, search_related_to_url, search_web
 from app import history
 from app.trends import REGIONS, get_trend_news, get_trending_keywords
 from app.writer import (
+    PROVIDERS,
     TRUNCATED_NOTICE,
+    default_provider,
     generate_article_from_url,
     generate_article_from_url_stream,
     generate_article_md,
     generate_article_md_stream,
     generate_article_meta,
+    get_model,
     revise_article_stream,
 )
 
@@ -38,6 +42,18 @@ app = FastAPI(title="티스토리 글 자동 생성", version="1.0.0")
 def api_regions():
     """지원 지역 목록 (트렌드용)"""
     return {"regions": [{"id": k, "name": v[0]} for k, v in REGIONS.items()]}
+
+
+@app.get("/api/config")
+def api_config():
+    """화면 초기 설정: 기본 AI, 제공자별 모델과 서버 키 설정 여부"""
+    env_keys = {"claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+    return {
+        "default_provider": default_provider(),
+        "providers": {
+            p: {"model": get_model(p), "has_server_key": bool(os.getenv(env_keys[p]))} for p in PROVIDERS
+        },
+    }
 
 
 @app.get("/api/trends")
@@ -131,9 +147,34 @@ def _validate_url(v: str, required: bool = True) -> Optional[str]:
 
 # ---------- 요청 모델 ----------
 
-class BaseGenerateRequest(BaseModel):
-    """글 생성 요청의 공통 베이스 클래스"""
+class ProviderRequest(BaseModel):
+    """AI 제공자 선택과 API 키 (비우면 서버 환경변수 사용)"""
+    provider: Optional[str] = None  # claude | openai (없으면 LLM_PROVIDER)
     anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if v not in PROVIDERS:
+            raise ValueError(f"지원하지 않는 AI입니다. ({', '.join(PROVIDERS)})")
+        return v
+
+    @field_validator("anthropic_api_key", "openai_api_key")
+    @classmethod
+    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_api_key(v)
+
+    @property
+    def resolved_provider(self) -> str:
+        return self.provider or default_provider()
+
+
+class BaseGenerateRequest(ProviderRequest):
+    """글 생성 요청의 공통 베이스 클래스"""
     lang: str = "ko"
     style: str = "정보성"
     length: str = "medium"
@@ -142,11 +183,6 @@ class BaseGenerateRequest(BaseModel):
     use_claude_search: bool = False  # True면 DuckDuckGo 대신 Claude 웹 검색 도구 사용
     include_sources: bool = True
     guide: Optional[str] = None
-
-    @field_validator("anthropic_api_key")
-    @classmethod
-    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_api_key(v)
 
     @field_validator("lang")
     @classmethod
@@ -202,14 +238,16 @@ class GenerateFromUrlRequest(BaseGenerateRequest):
 
 # ---------- 글 생성 공통 처리 ----------
 
-def _resolve_api_key(body: BaseModel) -> str:
-    """요청 body 또는 환경변수에서 API 키를 가져옵니다."""
-    api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+def _resolve_api_key(body: ProviderRequest) -> str:
+    """선택한 AI 제공자의 API 키를 요청 body 또는 환경변수에서 가져옵니다."""
+    if body.resolved_provider == "openai":
+        api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
+        missing = "OpenAI API 키가 없습니다. 세부 설정에 키를 입력하거나 .env 에 OPENAI_API_KEY 를 설정해 주세요."
+    else:
+        api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        missing = "Claude API 키가 없습니다. 세부 설정에 키를 입력하거나 .env 에 ANTHROPIC_API_KEY 를 설정해 주세요."
     if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="ANTHROPIC_API_KEY 환경변수 또는 요청 body의 anthropic_api_key를 설정해 주세요.",
-        )
+        raise HTTPException(status_code=400, detail=missing)
     return api_key
 
 
@@ -238,7 +276,7 @@ def _keyword_generate_kwargs(body: GenerateRequest) -> dict:
     """키워드 기반 글 생성 함수에 넘길 인자 (웹 검색·참고 URL 포함)"""
     api_key = _resolve_api_key(body)
     keyword = body.keyword.strip()
-    claude_search = body.use_web_search and body.use_claude_search
+    claude_search = body.use_web_search and body.use_claude_search and body.resolved_provider == "claude"
     web_context = ""
     if body.use_web_search and not claude_search:
         try:
@@ -258,13 +296,14 @@ def _keyword_generate_kwargs(body: GenerateRequest) -> dict:
         "reference_content": _fetch_reference_content(body.reference_url) if body.reference_url else None,
         "include_sources": body.include_sources,
         "claude_search": claude_search,
+        "provider": body.resolved_provider,
     }
 
 
 def _url_generate_kwargs(body: GenerateFromUrlRequest) -> dict:
     """URL 기반 글 생성 함수에 넘길 인자 (URL 분석·관련 검색 포함)"""
     api_key = _resolve_api_key(body)
-    claude_search = body.use_web_search and body.use_claude_search
+    claude_search = body.use_web_search and body.use_claude_search and body.resolved_provider == "claude"
     try:
         if body.use_web_search and not claude_search:
             url_content, related_search = search_related_to_url(
@@ -289,11 +328,20 @@ def _url_generate_kwargs(body: GenerateFromUrlRequest) -> dict:
         "guide": body.guide,
         "include_sources": body.include_sources,
         "claude_search": claude_search,
+        "provider": body.resolved_provider,
     }
 
 
 def _error_detail(e: Exception) -> str:
-    """Claude API 예외를 사용자용 한국어 메시지로 변환"""
+    """Claude / OpenAI API 예외를 사용자용 한국어 메시지로 변환"""
+    if isinstance(e, openai.AuthenticationError):
+        return "OpenAI API 키가 올바르지 않습니다. 키를 확인해 주세요."
+    if isinstance(e, openai.RateLimitError):
+        if getattr(e, "code", None) == "insufficient_quota" or "quota" in str(e).lower():
+            return "OpenAI API 사용 한도(크레딧)가 부족합니다. https://platform.openai.com/ 의 Billing 에서 확인해 주세요."
+        return "OpenAI API 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요."
+    if isinstance(e, openai.NotFoundError):
+        return "설정된 OpenAI 모델을 찾을 수 없습니다. .env 의 OPENAI_MODEL 을 계정에서 쓸 수 있는 모델로 바꿔 주세요."
     if isinstance(e, anthropic.AuthenticationError):
         return "Claude API 키가 올바르지 않습니다. 키를 확인해 주세요."
     if isinstance(e, anthropic.RateLimitError):
@@ -418,12 +466,11 @@ def api_generate_from_url_stream(
 
 # ---------- 글 다듬기 ----------
 
-class ReviseRequest(BaseModel):
+class ReviseRequest(ProviderRequest):
     """글 다듬기 요청. section이 있으면 그 부분만 고칩니다."""
     markdown: str
     instruction: str
     section: Optional[str] = None
-    anthropic_api_key: Optional[str] = None
 
     @field_validator("markdown")
     @classmethod
@@ -449,11 +496,6 @@ class ReviseRequest(BaseModel):
     def validate_section(cls, v: Optional[str]) -> Optional[str]:
         return v if v and v.strip() else None
 
-    @field_validator("anthropic_api_key")
-    @classmethod
-    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_api_key(v)
-
 
 @app.post("/api/revise/stream")
 def api_revise_stream(
@@ -465,7 +507,10 @@ def api_revise_stream(
     api_key = _resolve_api_key(body)
     return _stream_response(
         revise_article_stream,
-        {"markdown": body.markdown, "instruction": body.instruction, "section": body.section, "api_key": api_key},
+        {
+            "markdown": body.markdown, "instruction": body.instruction, "section": body.section,
+            "api_key": api_key, "provider": body.resolved_provider,
+        },
     )
 
 
@@ -520,10 +565,9 @@ def api_history_delete(article_id: int):
     return {"success": True}
 
 
-class MetaRequest(BaseModel):
+class MetaRequest(ProviderRequest):
     """제목 후보·메타 설명 생성 요청"""
     markdown: str
-    anthropic_api_key: Optional[str] = None
 
     @field_validator("markdown")
     @classmethod
@@ -531,11 +575,6 @@ class MetaRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("글 내용이 없습니다.")
         return v
-
-    @field_validator("anthropic_api_key")
-    @classmethod
-    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
-        return _validate_api_key(v)
 
 
 @app.post("/api/meta")
@@ -546,7 +585,10 @@ def api_meta(
 ):
     """생성된 글의 제목 후보와 SEO 메타 설명 생성"""
     api_key = _resolve_api_key(body)
-    meta = _run_generate(generate_article_meta, {"markdown": body.markdown, "api_key": api_key})
+    meta = _run_generate(
+        generate_article_meta,
+        {"markdown": body.markdown, "api_key": api_key, "provider": body.resolved_provider},
+    )
     return {"titles": meta.titles, "meta_description": meta.meta_description}
 
 

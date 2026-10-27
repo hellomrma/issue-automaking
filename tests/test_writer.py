@@ -147,3 +147,69 @@ class TestRevise:
         calls = fake_claude(["# 글"])
         list(writer.revise_article_stream("# 글", "톤을 밝게"))
         assert "[고칠 부분]" not in calls[0]["messages"][0]["content"]
+
+
+def _chunk(content=None, finish=None):
+    return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content), finish_reason=finish)])
+
+
+@pytest.fixture
+def fake_openai(monkeypatch):
+    """OpenAI 클라이언트를 가짜로 대체하고 create 호출 인자를 기록"""
+    calls = []
+
+    def install(result):
+        def _create(**kwargs):
+            calls.append(kwargs)
+            return result
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_create)))
+        monkeypatch.setattr(writer, "OpenAI", lambda api_key=None: client)
+        return calls
+
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    return install
+
+
+class TestOpenAI:
+    def test_streams_text(self, fake_openai):
+        calls = fake_openai(iter([_chunk("# 제목"), _chunk("\n본문"), _chunk(finish="stop")]))
+        text = "".join(writer.generate_article_md_stream("키워드", provider="openai"))
+        assert text == "# 제목\n본문"
+        assert calls[0]["model"] == writer.DEFAULT_OPENAI_MODEL
+        assert calls[0]["messages"][0]["role"] == "system"
+        assert calls[0]["stream"] is True
+
+    def test_length_finish_adds_notice(self, fake_openai):
+        fake_openai(iter([_chunk("# 제목"), _chunk(finish="length")]))
+        assert "".join(writer.generate_article_md_stream("키워드", provider="openai")).endswith(writer.TRUNCATED_NOTICE)
+
+    def test_content_filter_raises(self, fake_openai):
+        fake_openai(iter([_chunk(finish="content_filter")]))
+        with pytest.raises(RuntimeError, match="거절"):
+            list(writer.generate_article_md_stream("키워드", provider="openai"))
+
+    def test_model_from_env(self, fake_openai, monkeypatch):
+        calls = fake_openai(iter([_chunk(finish="stop")]))
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-custom")
+        list(writer.revise_article_stream("# 글", "짧게", provider="openai"))
+        assert calls[0]["model"] == "gpt-custom"
+
+    def test_meta_json(self, fake_openai):
+        message = SimpleNamespace(content='{"titles": ["A", "B"], "meta_description": "설명"}')
+        calls = fake_openai(SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")]))
+        meta = writer.generate_article_meta("# 글", provider="openai")
+        assert meta.titles == ["A", "B"]
+        assert calls[0]["response_format"] == {"type": "json_object"}
+
+    def test_meta_invalid_json(self, fake_openai):
+        message = SimpleNamespace(content="not json")
+        fake_openai(SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="length")]))
+        with pytest.raises(RuntimeError, match="length"):
+            writer.generate_article_meta("# 글", provider="openai")
+
+    def test_default_provider(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "OpenAI")
+        assert writer.default_provider() == "openai"
+        monkeypatch.setenv("LLM_PROVIDER", "unknown")
+        assert writer.default_provider() == "claude"

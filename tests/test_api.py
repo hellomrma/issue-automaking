@@ -215,7 +215,7 @@ class TestGenerateEndpoints:
 
         monkeypatch.setattr(
             "app.main.generate_article_meta",
-            lambda markdown, api_key: ArticleMeta(titles=["제목1", "제목2"], meta_description="설명"),
+            lambda markdown, api_key, provider: ArticleMeta(titles=["제목1", "제목2"], meta_description="설명"),
         )
         res = client.post("/api/meta", json={"markdown": "# 글\n본문"})
         assert res.status_code == 200
@@ -327,3 +327,98 @@ class TestStreamHistoryAndRevise:
     def test_revise_requires_instruction(self):
         res = client.post("/api/revise/stream", json={"markdown": "# 글", "instruction": "  "})
         assert res.status_code == 422
+
+
+class TestProviders:
+    """Claude / OpenAI 선택"""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        from app.rate_limit import generate_limiter
+
+        generate_limiter.requests.clear()
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-1234567890")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    def _capture(self, monkeypatch):
+        captured = {}
+
+        def _gen(**kwargs):
+            captured.update(kwargs)
+            return "# 글"
+
+        monkeypatch.setattr("app.main.generate_article_md", _gen)
+        return captured
+
+    def test_openai_requires_openai_key(self):
+        res = client.post("/api/generate", json={"keyword": "테스트", "provider": "openai", "use_web_search": False})
+        assert res.status_code == 400
+        assert "OpenAI API 키" in res.json()["detail"]
+
+    def test_openai_uses_request_key_and_duckduckgo(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr("app.main.search_web", lambda *a, **k: "검색결과")
+        res = client.post("/api/generate", json={
+            "keyword": "테스트", "provider": "openai", "openai_api_key": "sk-openai-test-key-123456",
+            "use_claude_search": True,
+        })
+        assert res.status_code == 200
+        assert captured["provider"] == "openai"
+        assert captured["api_key"] == "sk-openai-test-key-123456"
+        assert captured["claude_search"] is False  # Claude 웹 검색은 Claude 전용
+        assert captured["web_context"] == "검색결과"
+
+    def test_default_provider_from_env(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-key-1234567")
+        client.post("/api/generate", json={"keyword": "테스트", "use_web_search": False})
+        assert captured["provider"] == "openai"
+        assert captured["api_key"] == "sk-openai-env-key-1234567"
+
+    def test_invalid_provider(self):
+        res = client.post("/api/generate", json={"keyword": "테스트", "provider": "gemini"})
+        assert res.status_code == 422
+
+    def test_openai_error_messages(self):
+        import httpx2
+        import openai
+
+        from app.main import _error_detail
+
+        def err(cls, status, message="error", code=None):
+            body = {"error": {"code": code}} if code else None
+            response = httpx2.Response(status, request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"))
+            return cls(message, response=response, body=body)
+
+        assert "OpenAI API 키" in _error_detail(err(openai.AuthenticationError, 401))
+        assert "크레딧" in _error_detail(err(openai.RateLimitError, 429, "You exceeded your current quota", "insufficient_quota"))
+        assert "요청 한도" in _error_detail(err(openai.RateLimitError, 429, "Rate limit reached"))
+        assert "OPENAI_MODEL" in _error_detail(err(openai.NotFoundError, 404))
+
+    def test_config(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-key-1234567")
+        data = client.get("/api/config").json()
+        assert data["default_provider"] == "claude"
+        assert data["providers"]["openai"]["has_server_key"] is True
+        assert data["providers"]["claude"]["model"]
+
+    def test_meta_and_revise_pass_provider(self, monkeypatch):
+        from app.writer import ArticleMeta
+
+        seen = []
+        monkeypatch.setattr(
+            "app.main.generate_article_meta",
+            lambda markdown, api_key, provider: seen.append(provider) or ArticleMeta(titles=["t"], meta_description="d"),
+        )
+
+        def _revise(**kwargs):
+            seen.append(kwargs["provider"])
+            yield "x"
+
+        monkeypatch.setattr("app.main.revise_article_stream", _revise)
+        key = {"provider": "openai", "openai_api_key": "sk-openai-test-key-123456"}
+        client.post("/api/meta", json={"markdown": "# 글", **key})
+        client.post("/api/revise/stream", json={"markdown": "# 글", "instruction": "짧게", **key}).text
+        assert seen == ["openai", "openai"]

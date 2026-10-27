@@ -9,7 +9,7 @@
 ## 기술 스택
 
 - **백엔드**: FastAPI + Uvicorn
-- **AI**: Anthropic Claude API (claude-sonnet-5-5)
+- **AI**: Anthropic Claude API (claude-sonnet-5-5) 또는 OpenAI API (gpt-5, Chat Completions)
 - **트렌드**: trendspyg (Google Trends RSS/CSV)
 - **웹 검색**: DuckDuckGo Search
 - **프론트엔드**: 정적 HTML/CSS/JS (static 폴더)
@@ -56,7 +56,8 @@ tests/
 - `revise_article_stream()`: 글 전체 또는 한 섹션 다듬기
 - `generate_article_meta()`: 제목 후보·SEO 메타 설명 (구조화 출력)
 - `_build_prompts()`, `_build_url_prompts()`: 프롬프트 생성 헬퍼 (출처 표기·Claude 웹 검색 지시 포함)
-- `_stream_text()`: Claude 호출 공통부 (거절 폴백, 웹 검색 도구, pause_turn 이어받기)
+- `_stream_text()`: AI 호출 공통부. provider가 openai면 `_stream_text_openai()`, 아니면 Claude (거절 폴백, 웹 검색 도구, pause_turn 이어받기)
+- 생성·다듬기·메타 함수는 모두 `provider` 인자(claude | openai)를 받음. Claude 웹 검색은 Claude 전용
 
 ### app/trends.py
 - `get_trending_keywords()`: Google Trends 키워드 수집
@@ -91,13 +92,17 @@ python -m pip install -r requirements.txt
 | 변수 | 필수 | 설명 |
 |------|------|------|
 | `ANTHROPIC_API_KEY` | O (또는 웹에서 입력) | Claude API 키 |
+| `OPENAI_API_KEY` | X (OpenAI 사용 시) | OpenAI API 키 |
+| `LLM_PROVIDER` | X | 기본 AI: claude 또는 openai (기본: claude) |
 | `CLAUDE_MODEL` | X | 사용할 Claude 모델 (기본: claude-sonnet-5-5) |
+| `OPENAI_MODEL` | X | 사용할 OpenAI 모델 (기본: gpt-5) |
 | `USE_CSV_TRENDS` | X | CSV 트렌드 수집 활성화 (기본: false) |
 | `TRUST_PROXY` | X | 리버스 프록시 뒤에서 X-Forwarded-For로 클라이언트 식별 (기본: false) |
 | `HISTORY_DB` | X | 생성 이력 SQLite 경로 (기본: data/history.db) |
 
 ## API 엔드포인트
 
+- `GET /api/config`: 기본 AI, 제공자별 모델·서버 키 설정 여부
 - `GET /api/regions`: 지원 지역 목록
 - `GET /api/trends`: 인기 검색어 조회
 - `POST /api/generate`: 키워드 기반 글 생성
