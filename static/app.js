@@ -11,7 +11,6 @@ const EL = {
   keywordInputSection: document.getElementById("keywordInputSection"),
   urlInputSection: document.getElementById("urlInputSection"),
   styleRadios: document.querySelectorAll('input[name="style"]'),
-  length: document.getElementById("length"),
   useWebSearch: document.getElementById("useWebSearch"),
   useEmoji: document.getElementById("useEmoji"),
   apiKey: document.getElementById("apiKey"),
@@ -25,7 +24,12 @@ const EL = {
   tabPreview: document.getElementById("tabPreview"),
   charCount: document.getElementById("charCount"),
   copyMd: document.getElementById("copyMd"),
+  copyHtml: document.getElementById("copyHtml"),
+  genMeta: document.getElementById("genMeta"),
+  metaStatus: document.getElementById("metaStatus"),
+  metaPanel: document.getElementById("metaPanel"),
   downloadMd: document.getElementById("downloadMd"),
+  actionStatus: document.getElementById("actionStatus"),
 };
 
 // 현재 입력 모드 (keyword 또는 url)
@@ -36,8 +40,24 @@ function updateCharCount() {
   const text = EL.output?.textContent || "";
   const count = text.length;
   if (EL.charCount) {
-    EL.charCount.textContent = `${count.toLocaleString()}자`;
+    const sheets = Math.ceil(count / 200);
+    EL.charCount.textContent = count
+      ? `${count.toLocaleString()}자 (200자 원고지 ${sheets.toLocaleString()}매)`
+      : "0자";
   }
+}
+
+// 결과 영역 아래 짧은 알림 (alert 대신)
+let actionStatusTimer = null;
+function notify(text, type = "success") {
+  if (!EL.actionStatus) return;
+  setStatus(EL.actionStatus, text, type + " inline");
+  clearTimeout(actionStatusTimer);
+  actionStatusTimer = setTimeout(() => setStatus(EL.actionStatus, "", "inline"), 4000);
+}
+
+function getRadioValue(name, fallback) {
+  return document.querySelector(`input[name="${name}"]:checked`)?.value || fallback;
 }
 
 // 현재 진행 중인 요청을 취소하기 위한 AbortController
@@ -148,10 +168,16 @@ EL.fetchTrends?.addEventListener("click", async () => {
       keywords.forEach((k) => {
         const li = document.createElement("li");
 
-        const text = document.createElement("span");
+        const text = document.createElement("button");
+        text.type = "button";
         text.className = "keyword-text";
         text.textContent = k;
-        text.addEventListener("click", () => { EL.keyword.value = k; });
+        text.addEventListener("click", () => {
+          EL.keyword.value = k;
+          switchInputMode("keyword");
+          EL.trendsContainer.querySelectorAll("li.selected").forEach((el) => el.classList.remove("selected"));
+          li.classList.add("selected");
+        });
 
         const searchBtn = document.createElement("a");
         searchBtn.className = "keyword-search";
@@ -169,35 +195,44 @@ EL.fetchTrends?.addEventListener("click", async () => {
       return ul;
     }
 
-    results.forEach((res, i) => {
+    function appendKeywordBlock(title, keywords) {
+      const block = document.createElement("div");
+      block.className = "region-trends";
+      const h4 = document.createElement("h4");
+      h4.textContent = `${title} ${keywords.length}개`;
+      block.appendChild(h4);
+      block.appendChild(createKeywordList(keywords));
+      EL.trendsContainer.appendChild(block);
+    }
+
+    let recommendOnly = false;
+    results.forEach((res) => {
       if (res.status !== "fulfilled") return;
-      const { name, google } = res.value;
+      const { google, recommend } = res.value;
 
-      if (!google.length) return;
-
-      okCount += 1;
-      totalKw += google.length;
-
-      // 구글 트렌드 섹션
-      if (google.length > 0) {
-        const googleBlock = document.createElement("div");
-        googleBlock.className = "region-trends";
-        const googleH4 = document.createElement("h4");
-        googleH4.innerHTML = `<span class="source-badge google">Google</span> 실시간 트렌드 (${google.length}개)`;
-        googleBlock.appendChild(googleH4);
-        googleBlock.appendChild(createKeywordList(google));
-        EL.trendsContainer.appendChild(googleBlock);
+      if (google.length) {
+        okCount += 1;
+        totalKw += google.length;
+        appendKeywordBlock("Google 실시간 검색어", google);
+      } else if (recommend.length) {
+        // 실시간 검색어를 못 받으면 추천 주제로 대신 채움
+        okCount += 1;
+        totalKw += recommend.length;
+        recommendOnly = true;
+        appendKeywordBlock("추천 주제", recommend);
       }
     });
 
     if (okCount === 0) {
-      setStatus(EL.trendsStatus, "트렌드 데이터를 가져올 수 없습니다. 네트워크 또는 서버를 확인해 주세요.", "error");
+      setStatus(EL.trendsStatus, "검색어를 불러오지 못했습니다. 네트워크 연결과 서버 실행 상태를 확인해 주세요.", "error");
       return;
     }
     setStatus(
       EL.trendsStatus,
-      `총 ${totalKw}개 키워드를 불러왔습니다. 클릭하면 글 생성에 사용됩니다.`,
-      "success"
+      recommendOnly
+        ? "실시간 검색어를 받지 못해 추천 주제를 보여 드립니다. 누르면 키워드로 들어갑니다."
+        : "누르면 키워드로 들어갑니다.",
+      recommendOnly ? "warning" : ""
     );
   } catch (e) {
     const msg = (e.message === "Failed to fetch" || e.message === "Load failed") ? API_OFF_MSG : (e.message || "오류가 났습니다.");
@@ -238,7 +273,7 @@ async function generateArticle() {
     body = {
       url: url,
       style: selectedStyle,
-      length: EL.length?.value || "medium",
+      length: getRadioValue("length", "medium"),
       lang: "ko",
       use_emoji: !!EL.useEmoji?.checked,
       use_web_search: !!EL.useWebSearch?.checked,
@@ -256,7 +291,7 @@ async function generateArticle() {
     body = {
       keyword: kw,
       style: selectedStyle,
-      length: EL.length?.value || "medium",
+      length: getRadioValue("length", "medium"),
       lang: "ko",
       use_emoji: !!EL.useEmoji?.checked,
       use_web_search: !!EL.useWebSearch?.checked,
@@ -276,7 +311,10 @@ async function generateArticle() {
   EL.generate.disabled = true;
   EL.cancelGenerate?.classList.remove("hidden");
   EL.output.textContent = "";
+  EL.output.classList.add("streaming");
+  switchTab("source");
   updateCharCount();
+  clearMeta();
   saveApiKey();
 
   try {
@@ -309,16 +347,29 @@ async function generateArticle() {
       EL.output.scrollTop = EL.output.scrollHeight;
     }
 
-    // 에러 체크
+    // 코드 블록(```)으로 감싸진 경우 벗겨내기
+    const fenced = fullText.trim().match(/^```[^\n]*\n([\s\S]*?)\n```\s*$/);
+    if (fenced) {
+      fullText = fenced[1];
+      EL.output.textContent = fullText;
+      updateCharCount();
+    }
+
+    // 에러 / 잘림 경고 체크
+    const warnMatch = fullText.match(/\n*\[WARN\]\s*(.+)\s*$/);
     if (fullText.includes("[ERROR]")) {
       const errMatch = fullText.match(/\[ERROR\]\s*(.+)/);
       setStatus(EL.generateStatus, errMatch ? errMatch[1] : "생성 중 오류가 발생했습니다.", "error");
+    } else if (warnMatch) {
+      EL.output.textContent = fullText.slice(0, warnMatch.index);
+      updateCharCount();
+      setStatus(EL.generateStatus, warnMatch[1], "warning");
     } else {
-      setStatus(EL.generateStatus, "생성 완료. 아래에서 복사하거나 MD 파일로 저장하세요.", "success");
+      setStatus(EL.generateStatus, "다 썼습니다. ‘티스토리용 복사’로 에디터에 바로 붙여넣을 수 있습니다.", "success");
     }
   } catch (e) {
     if (e.name === "AbortError") {
-      setStatus(EL.generateStatus, "생성이 취소되었습니다.", "error");
+      setStatus(EL.generateStatus, "생성을 멈췄습니다. 지금까지 쓴 부분은 남아 있습니다.", "warning");
     } else {
       const msg = (e.message === "Failed to fetch" || e.message === "Load failed") ? API_OFF_MSG : (e.message || "오류가 났습니다.");
       setStatus(EL.generateStatus, msg, "error");
@@ -327,6 +378,7 @@ async function generateArticle() {
     EL.generate.disabled = false;
     EL.cancelGenerate?.classList.add("hidden");
     currentAbortController = null;
+    EL.output.classList.remove("streaming");
   }
 }
 
@@ -344,9 +396,104 @@ EL.copyMd?.addEventListener("click", () => {
   const text = EL.output?.textContent || "";
   if (!text) return;
   navigator.clipboard.writeText(text).then(
-    () => alert("클립보드에 복사했습니다."),
-    () => alert("복사에 실패했습니다.")
+    () => notify("마크다운을 복사했습니다."),
+    () => notify("복사하지 못했습니다. 브라우저의 클립보드 권한을 확인해 주세요.", "error")
   );
+});
+
+// 티스토리 에디터용 HTML 복사
+// 기본 모드에는 서식째(text/html), HTML 모드에는 소스(text/plain)로 붙여넣어집니다.
+EL.copyHtml?.addEventListener("click", async () => {
+  const md = EL.output?.textContent || "";
+  if (!md.trim()) return;
+  const html = renderMarkdownHtml(md);
+  if (html === null) {
+    notify("변환 도구를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침해 주세요.", "error");
+    return;
+  }
+  try {
+    if (typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([html], { type: "text/plain" }),
+        }),
+      ]);
+    } else {
+      await navigator.clipboard.writeText(html);
+    }
+    notify("복사했습니다. 티스토리 에디터에 붙여넣으세요.");
+  } catch (_) {
+    notify("복사하지 못했습니다. 브라우저의 클립보드 권한을 확인해 주세요.", "error");
+  }
+});
+
+// 제목 후보 · SEO 메타 설명 추천
+function clearMeta() {
+  if (EL.metaPanel) {
+    EL.metaPanel.innerHTML = "";
+    EL.metaPanel.classList.add("hidden");
+  }
+  if (EL.metaStatus) setStatus(EL.metaStatus, "");
+}
+
+function createMetaList(title, items) {
+  const frag = document.createDocumentFragment();
+  const h4 = document.createElement("h4");
+  h4.textContent = title;
+  const ul = document.createElement("ul");
+  items.forEach((text) => {
+    const li = document.createElement("li");
+    li.className = "meta-item";
+    li.textContent = text;
+    li.title = "클릭하면 복사";
+    li.addEventListener("click", () => {
+      navigator.clipboard.writeText(text).then(
+        () => setStatus(EL.metaStatus, "복사했습니다.", "success"),
+        () => setStatus(EL.metaStatus, "복사에 실패했습니다.", "error")
+      );
+    });
+    ul.appendChild(li);
+  });
+  frag.appendChild(h4);
+  frag.appendChild(ul);
+  return frag;
+}
+
+EL.genMeta?.addEventListener("click", async () => {
+  const md = EL.output?.textContent || "";
+  if (!md.trim()) {
+    setStatus(EL.metaStatus, "먼저 글을 생성해 주세요.", "error");
+    return;
+  }
+  const body = { markdown: md };
+  const key = (EL.apiKey?.value || "").trim();
+  if (key) body.anthropic_api_key = key;
+
+  clearMeta();
+  setStatus(EL.metaStatus, "제목 후보와 메타 설명을 만드는 중…", "loading");
+  EL.genMeta.disabled = true;
+  try {
+    const res = await fetch("/api/meta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = parseJsonOrFail(await res.text());
+    if (!res.ok) {
+      const detail = Array.isArray(data.detail) ? data.detail[0]?.msg : data.detail;
+      throw new Error(detail || "생성에 실패했습니다.");
+    }
+    EL.metaPanel.appendChild(createMetaList("제목 후보", data.titles || []));
+    EL.metaPanel.appendChild(createMetaList("메타 설명", [data.meta_description || ""]));
+    EL.metaPanel.classList.remove("hidden");
+    setStatus(EL.metaStatus, "항목을 클릭하면 복사됩니다.", "success");
+  } catch (e) {
+    const msg = (e.message === "Failed to fetch" || e.message === "Load failed") ? API_OFF_MSG : (e.message || "오류가 났습니다.");
+    setStatus(EL.metaStatus, msg, "error");
+  } finally {
+    EL.genMeta.disabled = false;
+  }
 });
 
 EL.downloadMd?.addEventListener("click", async () => {
@@ -363,12 +510,12 @@ EL.downloadMd?.addEventListener("click", async () => {
     });
     const data = await res.json();
     if (data.success) {
-      alert(`파일이 저장되었습니다: ${data.path}`);
+      notify(`${data.path}에 저장했습니다.`);
     } else {
-      alert(`저장 실패: ${data.detail || "알 수 없는 오류"}`);
+      notify(`저장하지 못했습니다: ${data.detail || "서버 응답을 확인해 주세요."}`, "error");
     }
   } catch (e) {
-    alert(`저장 실패: ${e.message}`);
+    notify(`저장하지 못했습니다: ${e.message}`, "error");
   }
 });
 
@@ -389,6 +536,12 @@ function switchTab(tab) {
   }
 }
 
+// 마크다운 → 안전한 HTML (LLM 출력에 섞인 스크립트 등 제거). 라이브러리가 없으면 null
+function renderMarkdownHtml(md) {
+  if (typeof marked === "undefined" || typeof DOMPurify === "undefined") return null;
+  return DOMPurify.sanitize(marked.parse(md));
+}
+
 function updatePreview() {
   const md = EL.output?.textContent || "";
   if (!md.trim()) {
@@ -396,14 +549,14 @@ function updatePreview() {
     return;
   }
   try {
-    // marked 라이브러리 사용
-    if (typeof marked !== "undefined") {
-      EL.preview.innerHTML = marked.parse(md);
+    const html = renderMarkdownHtml(md);
+    if (html !== null) {
+      EL.preview.innerHTML = html;
     } else {
-      EL.preview.innerHTML = "<p>마크다운 렌더링 라이브러리를 불러오지 못했습니다.</p>";
+      EL.preview.textContent = "마크다운 렌더링 라이브러리를 불러오지 못했습니다.";
     }
   } catch (e) {
-    EL.preview.innerHTML = `<p>렌더링 오류: ${e.message}</p>`;
+    EL.preview.textContent = `렌더링 오류: ${e.message}`;
   }
 }
 

@@ -1,10 +1,10 @@
 """트렌드 키워드 기반 티스토리 글 생성 웹 서비스"""
 import logging
 import os
-import re
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
+import anthropic
 from dotenv import load_dotenv
 
 logger = logging.getLogger("app.main")
@@ -21,6 +21,7 @@ from app.writer import (
     generate_article_from_url_stream,
     generate_article_md,
     generate_article_md_stream,
+    generate_article_meta,
 )
 
 load_dotenv()
@@ -193,6 +194,126 @@ class GenerateFromUrlRequest(BaseGenerateRequest):
         return _validate_url(v, required=True)
 
 
+# ---------- 글 생성 공통 처리 ----------
+
+def _resolve_api_key(body: BaseModel) -> str:
+    """요청 body 또는 환경변수에서 API 키를 가져옵니다."""
+    api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="ANTHROPIC_API_KEY 환경변수 또는 요청 body의 anthropic_api_key를 설정해 주세요.",
+        )
+    return api_key
+
+
+def _search_region(lang: str) -> str:
+    return "kr-ko" if lang == "ko" else "wt-wt"
+
+
+def _fetch_reference_content(url: str) -> Optional[str]:
+    """참고 URL의 제목·설명·본문을 프롬프트용 텍스트로 만듭니다. 실패 시 None."""
+    try:
+        ref_data = fetch_url_content(url)
+    except Exception as e:
+        logger.warning("fetch_url_content for reference_url failed: %s", e)
+        return None
+    ref_parts = []
+    if ref_data.get("title"):
+        ref_parts.append(f"제목: {ref_data['title']}")
+    if ref_data.get("description"):
+        ref_parts.append(f"설명: {ref_data['description']}")
+    if ref_data.get("content"):
+        ref_parts.append(f"본문:\n{ref_data['content']}")
+    return "\n\n".join(ref_parts) if ref_parts else None
+
+
+def _keyword_generate_kwargs(body: GenerateRequest) -> dict:
+    """키워드 기반 글 생성 함수에 넘길 인자 (웹 검색·참고 URL 포함)"""
+    api_key = _resolve_api_key(body)
+    keyword = body.keyword.strip()
+    web_context = ""
+    if body.use_web_search:
+        try:
+            web_context = search_web(keyword, max_results=5, region=_search_region(body.lang), timelimit="m")
+        except Exception as e:
+            logger.warning("search_web before generate: %s", e)
+
+    return {
+        "keyword": keyword,
+        "api_key": api_key,
+        "lang": body.lang,
+        "style": body.style,
+        "use_emoji": body.use_emoji,
+        "web_context": web_context or None,
+        "length": body.length,
+        "guide": body.guide,
+        "reference_content": _fetch_reference_content(body.reference_url) if body.reference_url else None,
+    }
+
+
+def _url_generate_kwargs(body: GenerateFromUrlRequest) -> dict:
+    """URL 기반 글 생성 함수에 넘길 인자 (URL 분석·관련 검색 포함)"""
+    api_key = _resolve_api_key(body)
+    try:
+        if body.use_web_search:
+            url_content, related_search = search_related_to_url(
+                body.url, max_results=5, max_news=5, region=_search_region(body.lang), timelimit="m"
+            )
+        else:
+            url_content, related_search = fetch_url_content(body.url), None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("search_related_to_url failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"URL 분석 중 오류가 발생했습니다: {e}")
+
+    return {
+        "url_content": url_content,
+        "api_key": api_key,
+        "lang": body.lang,
+        "style": body.style,
+        "use_emoji": body.use_emoji,
+        "related_search": related_search,
+        "length": body.length,
+        "guide": body.guide,
+    }
+
+
+def _error_detail(e: Exception) -> str:
+    """Claude API 예외를 사용자용 한국어 메시지로 변환"""
+    if isinstance(e, anthropic.AuthenticationError):
+        return "Claude API 키가 올바르지 않습니다. 키를 확인해 주세요."
+    if isinstance(e, anthropic.RateLimitError):
+        return "Claude API 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요."
+    if isinstance(e, anthropic.NotFoundError):
+        return "설정된 Claude 모델을 찾을 수 없습니다. .env 의 CLAUDE_MODEL 을 확인하거나, 최신 Anthropic 문서의 모델 목록을 참고해 주세요."
+    if isinstance(e, anthropic.BadRequestError) and "credit" in str(e).lower():
+        return "Claude(Anthropic) API 크레딧이 부족합니다. https://console.anthropic.com/ → Plans & Billing 에서 크레딧을 충전해 주세요."
+    return str(e)
+
+
+def _run_generate(func: Callable, kwargs: dict):
+    """생성 함수를 실행하고, 실패 시 502와 사용자용 메시지로 변환"""
+    try:
+        return func(**kwargs)
+    except Exception as e:
+        logger.exception("%s failed", func.__name__)
+        raise HTTPException(status_code=502, detail=_error_detail(e))
+
+
+def _stream_response(func: Callable[..., Iterator[str]], kwargs: dict) -> StreamingResponse:
+    """생성 스트림을 응답으로 감싸고, 도중 오류는 [ERROR] 줄로 전달"""
+    def generate():
+        try:
+            yield from func(**kwargs)
+        except Exception as e:
+            logger.exception("%s failed", func.__name__)
+            yield f"\n\n[ERROR] {_error_detail(e)}"
+
+    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
+
+
 @app.post("/api/generate")
 def api_generate(
     request: Request,
@@ -200,71 +321,8 @@ def api_generate(
     _: None = Depends(rate_limit(generate_limiter)),
 ):
     """키워드로 블로그 글(마크다운) 생성"""
-    api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="ANTHROPIC_API_KEY 환경변수 또는 요청 body의 anthropic_api_key를 설정해 주세요.",
-        )
-    if not (body.keyword or "").strip():
-        raise HTTPException(status_code=400, detail="keyword를 입력해 주세요.")
-    web_context = ""
-    if body.use_web_search:
-        try:
-            web_context = search_web(
-                body.keyword.strip(),
-                max_results=5,
-                region="kr-ko" if body.lang == "ko" else "wt-wt",
-                timelimit="m",
-            )
-        except Exception as e:
-            logger.warning("search_web before generate: %s", e)
-
-    # 참고 URL 콘텐츠 가져오기
-    reference_content = None
-    if body.reference_url:
-        try:
-            ref_data = fetch_url_content(body.reference_url)
-            ref_parts = []
-            if ref_data.get("title"):
-                ref_parts.append(f"제목: {ref_data['title']}")
-            if ref_data.get("description"):
-                ref_parts.append(f"설명: {ref_data['description']}")
-            if ref_data.get("content"):
-                ref_parts.append(f"본문:\n{ref_data['content'][:4000]}")
-            reference_content = "\n\n".join(ref_parts) if ref_parts else None
-        except Exception as e:
-            logger.warning("fetch_url_content for reference_url failed: %s", e)
-
-    try:
-        md = generate_article_md(
-            keyword=body.keyword.strip(),
-            api_key=api_key,
-            lang=body.lang,
-            style=body.style,
-            use_emoji=body.use_emoji,
-            web_context=web_context or None,
-            length=body.length,
-            guide=body.guide,
-            reference_content=reference_content,
-        )
-        return {"markdown": md, "keyword": body.keyword}
-    except Exception as e:
-        err_raw = getattr(e, "message", None) or getattr(e, "body", None) or str(e)
-        msg = (err_raw if isinstance(err_raw, str) else str(err_raw)).lower()
-        logger.exception("generate_article_md failed")
-
-        if any(x in msg for x in ("credit", "billing", "purchase credits", "too low", "upgrade", "plans")) or ("balance" in msg and "low" in msg):
-            detail = "Claude(Anthropic) API 크레딧이 부족합니다. https://console.anthropic.com/ → Plans & Billing 에서 크레딧을 충전해 주세요."
-        elif "rate" in msg and "limit" in msg:
-            detail = "Claude API 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요."
-        elif "invalid" in msg and ("key" in msg or "api" in msg) or "authentication" in msg:
-            detail = "Claude API 키가 올바르지 않습니다. 키를 확인해 주세요."
-        elif "not_found" in msg and "model" in msg:
-            detail = "설정된 Claude 모델을 찾을 수 없습니다. .env 의 CLAUDE_MODEL 을 확인하거나, 최신 Anthropic 문서의 모델 목록을 참고해 주세요."
-        else:
-            detail = str(e)
-        raise HTTPException(status_code=502, detail=detail)
+    md = _run_generate(generate_article_md, _keyword_generate_kwargs(body))
+    return {"markdown": md, "keyword": body.keyword}
 
 
 @app.post("/api/generate/stream")
@@ -274,71 +332,7 @@ def api_generate_stream(
     _: None = Depends(rate_limit(generate_limiter)),
 ):
     """키워드로 블로그 글(마크다운) 스트리밍 생성"""
-    api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="ANTHROPIC_API_KEY 환경변수 또는 요청 body의 anthropic_api_key를 설정해 주세요.",
-        )
-    if not (body.keyword or "").strip():
-        raise HTTPException(status_code=400, detail="keyword를 입력해 주세요.")
-
-    web_context = ""
-    if body.use_web_search:
-        try:
-            web_context = search_web(
-                body.keyword.strip(),
-                max_results=5,
-                region="kr-ko" if body.lang == "ko" else "wt-wt",
-                timelimit="m",
-            )
-        except Exception as e:
-            logger.warning("search_web before generate: %s", e)
-
-    # 참고 URL 콘텐츠 가져오기
-    reference_content = None
-    if body.reference_url:
-        try:
-            ref_data = fetch_url_content(body.reference_url)
-            ref_parts = []
-            if ref_data.get("title"):
-                ref_parts.append(f"제목: {ref_data['title']}")
-            if ref_data.get("description"):
-                ref_parts.append(f"설명: {ref_data['description']}")
-            if ref_data.get("content"):
-                ref_parts.append(f"본문:\n{ref_data['content'][:4000]}")
-            reference_content = "\n\n".join(ref_parts) if ref_parts else None
-        except Exception as e:
-            logger.warning("fetch_url_content for reference_url failed: %s", e)
-
-    def generate():
-        try:
-            for chunk in generate_article_md_stream(
-                keyword=body.keyword.strip(),
-                api_key=api_key,
-                lang=body.lang,
-                style=body.style,
-                use_emoji=body.use_emoji,
-                web_context=web_context or None,
-                length=body.length,
-                guide=body.guide,
-                reference_content=reference_content,
-            ):
-                yield chunk
-        except Exception as e:
-            err_raw = getattr(e, "message", None) or getattr(e, "body", None) or str(e)
-            msg = (err_raw if isinstance(err_raw, str) else str(err_raw)).lower()
-            logger.exception("generate_article_md_stream failed")
-            if any(x in msg for x in ("credit", "billing", "purchase credits", "too low", "upgrade", "plans")):
-                yield f"\n\n[ERROR] Claude(Anthropic) API 크레딧이 부족합니다."
-            elif "rate" in msg and "limit" in msg:
-                yield f"\n\n[ERROR] Claude API 요청 한도를 초과했습니다."
-            elif "invalid" in msg and ("key" in msg or "api" in msg):
-                yield f"\n\n[ERROR] Claude API 키가 올바르지 않습니다."
-            else:
-                yield f"\n\n[ERROR] {str(e)}"
-
-    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
+    return _stream_response(generate_article_md_stream, _keyword_generate_kwargs(body))
 
 
 @app.post("/api/generate-from-url")
@@ -348,59 +342,15 @@ def api_generate_from_url(
     _: None = Depends(rate_limit(generate_limiter)),
 ):
     """URL 콘텐츠를 분석하여 블로그 글(마크다운) 생성"""
-    api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="ANTHROPIC_API_KEY 환경변수 또는 요청 body의 anthropic_api_key를 설정해 주세요.",
-        )
-
-    # URL 콘텐츠 가져오기 및 관련 검색
-    try:
-        url_content, related_search = search_related_to_url(
-            body.url,
-            max_results=5 if body.use_web_search else 0,
-            max_news=5 if body.use_web_search else 0,
-            region="kr-ko" if body.lang == "ko" else "wt-wt",
-            timelimit="m",
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.warning("search_related_to_url failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"URL 분석 중 오류가 발생했습니다: {e}")
-
-    try:
-        md = generate_article_from_url(
-            url_content=url_content,
-            api_key=api_key,
-            lang=body.lang,
-            style=body.style,
-            use_emoji=body.use_emoji,
-            related_search=related_search if body.use_web_search else None,
-            length=body.length,
-            guide=body.guide,
-        )
-        return {
-            "markdown": md,
-            "url": body.url,
-            "analyzed_title": url_content.get("title", ""),
-            "keywords": url_content.get("keywords", []),
-        }
-    except Exception as e:
-        err_raw = getattr(e, "message", None) or getattr(e, "body", None) or str(e)
-        msg = (err_raw if isinstance(err_raw, str) else str(err_raw)).lower()
-        logger.exception("generate_article_from_url failed")
-
-        if any(x in msg for x in ("credit", "billing", "purchase credits", "too low", "upgrade", "plans")) or ("balance" in msg and "low" in msg):
-            detail = "Claude(Anthropic) API 크레딧이 부족합니다. https://console.anthropic.com/ → Plans & Billing 에서 크레딧을 충전해 주세요."
-        elif "rate" in msg and "limit" in msg:
-            detail = "Claude API 요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요."
-        elif "invalid" in msg and ("key" in msg or "api" in msg) or "authentication" in msg:
-            detail = "Claude API 키가 올바르지 않습니다. 키를 확인해 주세요."
-        else:
-            detail = str(e)
-        raise HTTPException(status_code=502, detail=detail)
+    kwargs = _url_generate_kwargs(body)
+    md = _run_generate(generate_article_from_url, kwargs)
+    url_content = kwargs["url_content"]
+    return {
+        "markdown": md,
+        "url": body.url,
+        "analyzed_title": url_content.get("title", ""),
+        "keywords": url_content.get("keywords", []),
+    }
 
 
 @app.post("/api/generate-from-url/stream")
@@ -410,55 +360,37 @@ def api_generate_from_url_stream(
     _: None = Depends(rate_limit(generate_limiter)),
 ):
     """URL 콘텐츠를 분석하여 블로그 글(마크다운) 스트리밍 생성"""
-    api_key = body.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="ANTHROPIC_API_KEY 환경변수 또는 요청 body의 anthropic_api_key를 설정해 주세요.",
-        )
+    return _stream_response(generate_article_from_url_stream, _url_generate_kwargs(body))
 
-    # URL 콘텐츠 가져오기 및 관련 검색
-    try:
-        url_content, related_search = search_related_to_url(
-            body.url,
-            max_results=5 if body.use_web_search else 0,
-            max_news=5 if body.use_web_search else 0,
-            region="kr-ko" if body.lang == "ko" else "wt-wt",
-            timelimit="m",
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.warning("search_related_to_url failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"URL 분석 중 오류가 발생했습니다: {e}")
 
-    def generate():
-        try:
-            for chunk in generate_article_from_url_stream(
-                url_content=url_content,
-                api_key=api_key,
-                lang=body.lang,
-                style=body.style,
-                use_emoji=body.use_emoji,
-                related_search=related_search if body.use_web_search else None,
-                length=body.length,
-                guide=body.guide,
-            ):
-                yield chunk
-        except Exception as e:
-            err_raw = getattr(e, "message", None) or getattr(e, "body", None) or str(e)
-            msg = (err_raw if isinstance(err_raw, str) else str(err_raw)).lower()
-            logger.exception("generate_article_from_url_stream failed")
-            if any(x in msg for x in ("credit", "billing", "purchase credits", "too low", "upgrade", "plans")):
-                yield f"\n\n[ERROR] Claude(Anthropic) API 크레딧이 부족합니다."
-            elif "rate" in msg and "limit" in msg:
-                yield f"\n\n[ERROR] Claude API 요청 한도를 초과했습니다."
-            elif "invalid" in msg and ("key" in msg or "api" in msg):
-                yield f"\n\n[ERROR] Claude API 키가 올바르지 않습니다."
-            else:
-                yield f"\n\n[ERROR] {str(e)}"
+class MetaRequest(BaseModel):
+    """제목 후보·메타 설명 생성 요청"""
+    markdown: str
+    anthropic_api_key: Optional[str] = None
 
-    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
+    @field_validator("markdown")
+    @classmethod
+    def validate_markdown(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("글 내용이 없습니다.")
+        return v
+
+    @field_validator("anthropic_api_key")
+    @classmethod
+    def validate_api_key(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_api_key(v)
+
+
+@app.post("/api/meta")
+def api_meta(
+    request: Request,
+    body: MetaRequest,
+    _: None = Depends(rate_limit(generate_limiter)),
+):
+    """생성된 글의 제목 후보와 SEO 메타 설명 생성"""
+    api_key = _resolve_api_key(body)
+    meta = _run_generate(generate_article_meta, {"markdown": body.markdown, "api_key": api_key})
+    return {"titles": meta.titles, "meta_description": meta.meta_description}
 
 
 class SaveMarkdownRequest(BaseModel):

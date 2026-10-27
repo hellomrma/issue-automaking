@@ -137,3 +137,90 @@ class TestGenerateAPI:
         response = client.post("/api/generate", json={"keyword": "테스트 키워드"})
         # 환경변수에 API 키가 있으면 200, 없으면 400
         assert response.status_code in (200, 400, 502)
+
+
+def _api_error(cls, status, message="error"):
+    import anthropic
+    import httpx2
+
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"))
+    return cls(message, response=response, body=None)
+
+
+class TestErrorDetail:
+    """Claude API 예외 → 사용자 메시지 변환"""
+
+    def test_typed_errors(self):
+        import anthropic
+
+        from app.main import _error_detail
+
+        assert "키가 올바르지" in _error_detail(_api_error(anthropic.AuthenticationError, 401))
+        assert "한도" in _error_detail(_api_error(anthropic.RateLimitError, 429))
+        assert "모델" in _error_detail(_api_error(anthropic.NotFoundError, 404))
+        assert "크레딧" in _error_detail(
+            _api_error(anthropic.BadRequestError, 400, "Your credit balance is too low")
+        )
+
+    def test_unknown_error_passthrough(self):
+        from app.main import _error_detail
+
+        assert _error_detail(RuntimeError("기타 오류")) == "기타 오류"
+
+
+class TestGenerateEndpoints:
+    """생성 엔드포인트 (Claude 호출은 모킹)"""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        from app.rate_limit import generate_limiter
+
+        generate_limiter.requests.clear()
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-1234567890")
+
+    def test_stream_error_line(self, monkeypatch):
+        """스트리밍 중 예외는 [ERROR] 줄로 전달"""
+        import anthropic
+
+        def _fail(**kwargs):
+            yield "# 제목"
+            raise _api_error(anthropic.AuthenticationError, 401)
+
+        monkeypatch.setattr("app.main.generate_article_md_stream", _fail)
+        res = client.post("/api/generate/stream", json={"keyword": "테스트", "use_web_search": False})
+        assert res.status_code == 200
+        assert res.text.startswith("# 제목")
+        assert "[ERROR] Claude API 키가 올바르지 않습니다." in res.text
+
+    def test_url_mode_without_web_search_skips_search(self, monkeypatch):
+        """웹 검색을 끄면 관련 검색을 호출하지 않음"""
+        monkeypatch.setattr(
+            "app.main.search_related_to_url",
+            lambda *a, **k: pytest.fail("search_related_to_url should not be called"),
+        )
+        monkeypatch.setattr("app.main.fetch_url_content", lambda url: {"url": url, "title": "T", "content": "C"})
+        captured = {}
+
+        def _gen(**kwargs):
+            captured.update(kwargs)
+            return "# 글"
+
+        monkeypatch.setattr("app.main.generate_article_from_url", _gen)
+        res = client.post("/api/generate-from-url", json={"url": "https://example.com", "use_web_search": False})
+        assert res.status_code == 200
+        assert captured["related_search"] is None
+
+    def test_meta(self, monkeypatch):
+        from app.writer import ArticleMeta
+
+        monkeypatch.setattr(
+            "app.main.generate_article_meta",
+            lambda markdown, api_key: ArticleMeta(titles=["제목1", "제목2"], meta_description="설명"),
+        )
+        res = client.post("/api/meta", json={"markdown": "# 글\n본문"})
+        assert res.status_code == 200
+        assert res.json() == {"titles": ["제목1", "제목2"], "meta_description": "설명"}
+
+    def test_meta_empty_markdown(self):
+        res = client.post("/api/meta", json={"markdown": "  "})
+        assert res.status_code == 422

@@ -64,7 +64,7 @@ python -m pip install -r requirements.txt
 ## 환경 변수
 
 - `ANTHROPIC_API_KEY`: Claude API 키 (필수 또는 웹에서 입력)
-- `CLAUDE_MODEL`: Claude 모델 ID (기본: claude-sonnet-4-20250514)
+- `CLAUDE_MODEL`: Claude 모델 ID (기본: claude-sonnet-5-5)
 - `USE_CSV_TRENDS`: CSV 트렌드 수집 활성화 (기본: false)
 
 ## API 엔드포인트

@@ -9,7 +9,7 @@
 ## 기술 스택
 
 - **백엔드**: FastAPI + Uvicorn
-- **AI**: Anthropic Claude API (claude-sonnet-4)
+- **AI**: Anthropic Claude API (claude-sonnet-5-5)
 - **트렌드**: trendspyg (Google Trends RSS/CSV)
 - **웹 검색**: DuckDuckGo Search
 - **프론트엔드**: 정적 HTML/CSS/JS (static 폴더)
@@ -81,7 +81,7 @@ python -m pip install -r requirements.txt
 | 변수 | 필수 | 설명 |
 |------|------|------|
 | `ANTHROPIC_API_KEY` | O (또는 웹에서 입력) | Claude API 키 |
-| `CLAUDE_MODEL` | X | 사용할 Claude 모델 (기본: claude-sonnet-4-20250514) |
+| `CLAUDE_MODEL` | X | 사용할 Claude 모델 (기본: claude-sonnet-5-5) |
 | `USE_CSV_TRENDS` | X | CSV 트렌드 수집 활성화 (기본: false) |
 
 ## API 엔드포인트
@@ -92,6 +92,7 @@ python -m pip install -r requirements.txt
 - `POST /api/generate/stream`: 키워드 기반 글 스트리밍 생성
 - `POST /api/generate-from-url`: URL 기반 글 생성
 - `POST /api/generate-from-url/stream`: URL 기반 글 스트리밍 생성
+- `POST /api/meta`: 생성된 글의 제목 후보·SEO 메타 설명 생성
 
 ## 코드 스타일
 

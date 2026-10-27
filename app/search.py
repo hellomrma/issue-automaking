@@ -5,7 +5,7 @@ import re
 import socket
 import time
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,6 +17,10 @@ _IGNORE_TAGS = {"script", "style", "nav", "footer", "header", "aside", "noscript
 
 # SSRF 차단 대상 호스트
 _BLOCKED_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+# URL 콘텐츠 다운로드 제한
+_MAX_REDIRECTS = 5
+_MAX_DOWNLOAD_BYTES = 3 * 1024 * 1024  # 3MB
 
 
 # ---------- 검색 결과 캐싱 ----------
@@ -156,6 +160,57 @@ def is_safe_url(url: str) -> bool:
         raise ValueError(f"URL 검증 오류: {e}")
 
 
+def _download_html(url: str, headers: dict, timeout: int) -> tuple[bytes, Optional[str]]:
+    """
+    리다이렉트를 직접 따라가며 단계마다 SSRF 검증 후 HTML을 내려받습니다.
+    응답 크기는 _MAX_DOWNLOAD_BYTES로 제한합니다.
+
+    Returns:
+        (본문 bytes, Content-Type의 charset 또는 None)
+    """
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        # SSRF 공격 방지: 리다이렉트 대상까지 매번 검증
+        is_safe_url(current)
+        try:
+            resp = requests.get(current, headers=headers, timeout=timeout, allow_redirects=False, stream=True)
+        except Exception as e:
+            logger.warning("fetch_url_content request failed: %s", e)
+            raise ValueError(f"URL을 가져올 수 없습니다: {e}")
+        if not resp.is_redirect:
+            break
+        current = urljoin(current, resp.headers.get("location", ""))
+        resp.close()
+    else:
+        raise ValueError("리다이렉트가 너무 많습니다.")
+
+    with resp:
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            raise ValueError(f"URL을 가져올 수 없습니다: {e}")
+
+        content_type = resp.headers.get("content-type", "").lower()
+        if content_type and "html" not in content_type and not content_type.startswith("text/"):
+            raise ValueError(f"웹 페이지(HTML)만 분석할 수 있습니다. (Content-Type: {content_type})")
+
+        chunks = []
+        size = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=65536):
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= _MAX_DOWNLOAD_BYTES:
+                    logger.info("fetch_url_content: %d bytes 초과, 이후 내용은 무시", _MAX_DOWNLOAD_BYTES)
+                    break
+        except Exception as e:
+            logger.warning("fetch_url_content read failed: %s", e)
+            raise ValueError(f"URL을 가져올 수 없습니다: {e}")
+
+        charset = resp.encoding if "charset=" in content_type else None
+    return b"".join(chunks)[:_MAX_DOWNLOAD_BYTES], charset
+
+
 def fetch_url_content(url: str, timeout: int = 15) -> dict:
     """
     URL의 콘텐츠를 가져와서 제목, 본문 텍스트, 메타 설명을 추출합니다.
@@ -172,9 +227,6 @@ def fetch_url_content(url: str, timeout: int = 15) -> dict:
     Raises:
         ValueError: URL이 안전하지 않거나 접근 불가한 경우
     """
-    # SSRF 공격 방지: URL 안전성 검증
-    is_safe_url(url)
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -189,16 +241,8 @@ def fetch_url_content(url: str, timeout: int = 15) -> dict:
         "keywords": [],
     }
 
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        resp.encoding = resp.apparent_encoding or "utf-8"
-        html = resp.text
-    except Exception as e:
-        logger.warning("fetch_url_content request failed: %s", e)
-        raise ValueError(f"URL을 가져올 수 없습니다: {e}")
-
-    soup = BeautifulSoup(html, "html.parser")
+    raw, charset = _download_html(url, headers, timeout)
+    soup = BeautifulSoup(raw, "html.parser", from_encoding=charset)
 
     # 제목 추출
     if soup.title and soup.title.string:
